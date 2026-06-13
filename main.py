@@ -464,15 +464,29 @@ class Database:
             return []
 
     async def get_all_users(self):
-        # Faqat botni /start qilgan (started_bot=1) va banlanmagan userlar.
-        # Aks holda broadcast Telegram tomonidan rad etiladi ("can't initiate conversation").
+        # Banlanmagan va "o'lik" deb belgilanmagan (started_bot != -1) userlar.
+        # started_bot:  1 = yetadi (DM/oldingi broadcast OK),  0 = noma'lum (hali sinalmagan),
+        #              -1 = o'lik (Forbidden/bloklangan — qayta urinilmaydi).
+        # Broadcast natijaga qarab bu flagni yangilaydi (set_reachable) — ro'yxat o'z-o'zini tozalaydi.
         try:
             async with self.get_connection() as conn:
-                cursor = await conn.execute('SELECT user_id, username, first_name FROM users WHERE is_banned = 0 AND started_bot = 1 ORDER BY user_id')
+                cursor = await conn.execute('SELECT user_id, username, first_name FROM users WHERE is_banned = 0 AND started_bot != -1 ORDER BY started_bot DESC, user_id')
                 rows = await cursor.fetchall()
                 return [(row['user_id'], row['username'], row['first_name']) for row in rows]
         except Exception:
             return []
+
+    async def set_reachable(self, user_id: int, reachable: bool) -> None:
+        """Broadcast natijasiga ko'ra userni 'yetadi' (1) yoki 'o'lik' (-1) deb belgilaydi."""
+        try:
+            async with self.get_connection() as conn:
+                await conn.execute(
+                    'UPDATE users SET started_bot = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?',
+                    (1 if reachable else -1, user_id)
+                )
+                await conn.commit()
+        except Exception:
+            pass
 
     async def mark_user_started(self, user_id: int, username: str, first_name: str) -> None:
         """Foydalanuvchi botni shaxsiy chatda ochganini belgilaydi (broadcast uchun yetib boradigan)."""
@@ -1341,9 +1355,13 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
         try:
             await bot.copy_message(chat_id=user_id, from_chat_id=from_chat_id, message_id=message_id)
             success_count += 1
+            # Yetdi — 'reachable' deb belgilaymiz (keyingi broadcastlarda tez topiladi)
+            await db.set_reachable(user_id, True)
             logger.info(f"Broadcast sent to user {username or first_name} ({user_id})")
         except (Forbidden, BadRequest) as e:
             fail_count += 1
+            # Yetib bo'lmadi (bloklangan/start qilmagan) — 'o'lik' deb belgilaymiz, qayta urinilmaydi
+            await db.set_reachable(user_id, False)
             failed_list.append(('user', username or first_name or str(user_id), str(e)))
             logger.warning(f"Failed to send to user {user_id}: {e}")
         except TelegramError as e:
