@@ -1,0 +1,11 @@
+venv/
+venvcl/
+__pycache__/
+*.py[cod]
+*.log
+bot_data.db
+bot_data.db-shm
+bot_data.db-wal
+*.backup_*
+main_b64.txt
+.env
