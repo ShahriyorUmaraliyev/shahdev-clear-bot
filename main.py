@@ -464,13 +464,14 @@ class Database:
             return []
 
     async def get_all_users(self):
-        # Banlanmagan va "o'lik" deb belgilanmagan (started_bot != -1) userlar.
-        # started_bot:  1 = yetadi (DM/oldingi broadcast OK),  0 = noma'lum (hali sinalmagan),
-        #              -1 = o'lik (Forbidden/bloklangan — qayta urinilmaydi).
-        # Broadcast natijaga qarab bu flagni yangilaydi (set_reachable) — ro'yxat o'z-o'zini tozalaydi.
+        # OPT-IN ro'yxat: faqat botni shaxsiy chatda OCHGAN (started_bot = 1) odamlar.
+        # Guruhda yozib qolgan, lekin botni ochmagan odamlarga broadcast YUBORILMAYDI —
+        # bu Telegram'ning so'ralmagan-xabar taqiqiga mos va botni ban xavfidan saqlaydi.
+        # started_bot: 1 = obunachi (DM ochgan),  0 = guruh a'zosi (nishon emas),
+        #             -1 = bloklagan (broadcast'da Forbidden bo'lgan, ro'yxatdan chiqarilgan).
         try:
             async with self.get_connection() as conn:
-                cursor = await conn.execute('SELECT user_id, username, first_name FROM users WHERE is_banned = 0 AND started_bot != -1 ORDER BY started_bot DESC, user_id')
+                cursor = await conn.execute('SELECT user_id, username, first_name FROM users WHERE is_banned = 0 AND started_bot = 1 ORDER BY user_id')
                 rows = await cursor.fetchall()
                 return [(row['user_id'], row['username'], row['first_name']) for row in rows]
         except Exception:
