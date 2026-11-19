@@ -19,6 +19,7 @@ os.environ['ADMIN_IDS'] = '555, 666;777'
 os.environ['BOT_USERNAME'] = '@test_bot'
 os.environ['DB_PATH'] = os.path.join(TMP, 'test.db')
 os.environ['BACKUP_DIR'] = os.path.join(TMP, 'backups')
+os.environ['ALLOWED_CHANNELS'] = '@sedoy_parfyum, -1009999'
 
 sys.path.insert(0, ROOT)
 import main as m  # noqa: E402
@@ -101,6 +102,96 @@ check('noma\'lum xato -> transient',
       m._classify_broadcast_error(BadRequest('Something weird happened')), 'transient')
 check('Internal Server Error -> transient',
       m._classify_broadcast_error(BadRequest('Internal Server Error')), 'transient')
+
+
+# --------------------------------------------------------------- 3b. sender_chat
+section('Kanal/anonim admin nomidan yuborilgan xabarlar')
+from types import SimpleNamespace  # noqa: E402
+from telegram.error import TelegramError  # noqa: E402
+
+check('ALLOWED_CHANNELS username o\'qildi',
+      'sedoy_parfyum' in m.config.ALLOWED_CHANNEL_USERNAMES, True)
+check('ALLOWED_CHANNELS ID o\'qildi', -1009999 in m.config.ALLOWED_CHANNEL_IDS, True)
+
+
+def _chat(cid, username=None, title=None):
+    return SimpleNamespace(id=cid, username=username, title=title)
+
+
+def _msg(chat, sender_chat=None, auto=False):
+    return SimpleNamespace(chat=chat, sender_chat=sender_chat, is_automatic_forward=auto)
+
+
+class _FakeBot:
+    def __init__(self, linked=None, fail=False):
+        self.linked = linked
+        self.fail = fail
+        self.calls = 0
+
+    async def get_chat(self, chat_id):
+        self.calls += 1
+        if self.fail:
+            raise TelegramError('get_chat ishlamadi')
+        return SimpleNamespace(linked_chat_id=self.linked)
+
+
+def _ctx(bot):
+    return SimpleNamespace(bot=bot)
+
+
+async def sender_chat_tests():
+    GROUP = _chat(-1001111, title='Mening guruhim')
+
+    m._linked_chat.clear()
+    check('sender_chat yo\'q -> oddiy tekshiruv',
+          await m._check_sender_chat(_ctx(_FakeBot()), _msg(GROUP)), None)
+
+    m._linked_chat.clear()
+    check('guruh nomidan (anonim admin) -> RUXSAT',
+          await m._check_sender_chat(_ctx(_FakeBot()), _msg(GROUP, sender_chat=_chat(-1001111))),
+          (True, 'anonim_admin'))
+
+    m._linked_chat.clear()
+    check('bog\'langan kanal posti (avto-forward) -> RUXSAT',
+          await m._check_sender_chat(_ctx(_FakeBot()), _msg(GROUP, sender_chat=_chat(-1002222), auto=True)),
+          (True, 'boglangan_kanal_posti'))
+
+    m._linked_chat.clear()
+    check('ALLOWED_CHANNELS dagi kanal (@username) -> RUXSAT',
+          await m._check_sender_chat(_ctx(_FakeBot()),
+                                     _msg(GROUP, sender_chat=_chat(-1003333, username='sedoy_parfyum'))),
+          (True, 'ruxsat_berilgan_kanal'))
+
+    m._linked_chat.clear()
+    check('ALLOWED_CHANNELS dagi kanal (ID) -> RUXSAT',
+          await m._check_sender_chat(_ctx(_FakeBot()), _msg(GROUP, sender_chat=_chat(-1009999))),
+          (True, 'ruxsat_berilgan_kanal'))
+
+    m._linked_chat.clear()
+    check('guruhga bog\'langan kanal nomidan -> RUXSAT',
+          await m._check_sender_chat(_ctx(_FakeBot(linked=-1004444)),
+                                     _msg(GROUP, sender_chat=_chat(-1004444))),
+          (True, 'boglangan_kanal'))
+
+    m._linked_chat.clear()
+    check('begona kanal nomidan -> RUXSAT YO\'Q',
+          await m._check_sender_chat(_ctx(_FakeBot(linked=-1004444)),
+                                     _msg(GROUP, sender_chat=_chat(-1005555))),
+          (False, 'begona_kanal'))
+
+    # Kesh: get_chat soatiga bir marta chaqirilishi kerak
+    m._linked_chat.clear()
+    bot = _FakeBot(linked=-1004444)
+    for _ in range(5):
+        await m._check_sender_chat(_ctx(bot), _msg(GROUP, sender_chat=_chat(-1005555)))
+    check('get_chat keshlanadi (5 xabar -> 1 so\'rov)', bot.calls, 1)
+
+    # get_chat xato bersa kesh buzilmaydi va qayta uriniladi
+    m._linked_chat.clear()
+    badbot = _FakeBot(fail=True)
+    res = await m._check_sender_chat(_ctx(badbot), _msg(GROUP, sender_chat=_chat(-1005555)))
+    check('get_chat xatosi qulatmaydi', res, (False, 'begona_kanal'))
+    check('xatoda kesh yozilmaydi (qayta uriniladi)', len(m._linked_chat), 0)
 
 
 # --------------------------------------------------------------- 4. FloodControl
@@ -200,6 +291,7 @@ async def cache_tests():
 
 
 async def main_async():
+    await sender_chat_tests()
     await flood_tests()
     await db_tests()
     await cache_tests()

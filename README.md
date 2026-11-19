@@ -62,6 +62,20 @@ Har biri xabarga **reply** qilib yoki `/unban <ID yoki @username>` shaklida ishl
 | `/refreshadmins` | admin ro'yxatlarini qayta yuklash |
 | `/cancel` | xabar tarqatishni bekor qilish |
 
+## Kanal nomidan yuborilgan xabarlar
+
+Telegram'da kanal yoki guruh nomidan yuborilgan xabarda haqiqiy yuboruvchi
+ko'rsatilmaydi — o'rniga xizmat akkaunti turadi. Shuning uchun bunday
+xabarlar alohida tekshiriladi va quyidagilar **o'chirilmaydi**:
+
+- guruhning o'zi nomidan yozilgan xabar (anonim admin)
+- guruhga bog'langan kanalning avtomatik forward qilingan posti
+- bog'langan kanal nomidan yozilgan xabar
+- `ALLOWED_CHANNELS` ro'yxatidagi kanallar
+
+Boshqa kanal nomidan kelgan reklama o'chiriladi (kanalga ogohlantirish
+berib bo'lmaydi, shuning uchun faqat xabar o'chadi).
+
 ## Maxfiylik
 
 Oddiy xabarlar matni bazaga **yozilmaydi**. Faqat o'chirilgan spam/flood

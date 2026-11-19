@@ -76,6 +76,9 @@ class Config:
     LOG_MESSAGE_TEXT: bool = field(default_factory=lambda: _env_bool("LOG_MESSAGE_TEXT", False))
     # Har qanday @username reklama deb hisoblansinmi (default: YO'Q — oddiy tag jazolanmaydi)
     BLOCK_MENTIONS: bool = field(default_factory=lambda: _env_bool("BLOCK_MENTIONS", False))
+    # Nomidan erkin yozishi mumkin bo'lgan kanallar: ALLOWED_CHANNELS=@mening_kanalim,-1001234567890
+    ALLOWED_CHANNEL_IDS: frozenset = field(init=False)
+    ALLOWED_CHANNEL_USERNAMES: frozenset = field(init=False)
 
     MAX_WARNS: int = 3
     MUTE_DURATION_MINUTES: int = 10
@@ -112,6 +115,18 @@ class Config:
             self.ADMIN_ID = sorted(ids)[0]
         self.ADMIN_IDS = frozenset(ids)
 
+        chan_ids, chan_names = set(), set()
+        for part in re.split(r'[,\s;]+', os.getenv("ALLOWED_CHANNELS", "") or ""):
+            part = part.strip()
+            if not part:
+                continue
+            if part.lstrip('-').isdigit():
+                chan_ids.add(int(part))
+            else:
+                chan_names.add(part.lstrip('@').lower())
+        self.ALLOWED_CHANNEL_IDS = frozenset(chan_ids)
+        self.ALLOWED_CHANNEL_USERNAMES = frozenset(chan_names)
+
         patterns = [
             r'http[s]?://(?:[a-zA-Z0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
             r'www\.[a-zA-Z0-9-]+\.[a-zA-Z]{2,}',
@@ -126,6 +141,15 @@ class Config:
             r'tinyurl\.com/[a-zA-Z0-9]+',
         ]
         self.LINK_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in patterns)
+
+    def is_allowed_channel(self, sender_chat) -> bool:
+        """Shu kanal nomidan yozishga ruxsat berilganmi (ALLOWED_CHANNELS)."""
+        if sender_chat is None:
+            return False
+        if sender_chat.id in self.ALLOWED_CHANNEL_IDS:
+            return True
+        uname = (getattr(sender_chat, 'username', None) or '').lower()
+        return bool(uname) and uname in self.ALLOWED_CHANNEL_USERNAMES
 
     def validate(self) -> bool:
         if not self.BOT_TOKEN:
@@ -195,6 +219,11 @@ def error_handler(func):
             logger.exception(f"Unexpected error in {func.__name__}: {e}")
             raise
     return wrapper
+
+
+# Telegram xizmat akkauntlari (rasmiy, o'zgarmas ID lar)
+GROUP_ANONYMOUS_BOT_ID = 1087968824   # anonim admin nomidan yuborilgan xabarlar
+CHANNEL_BOT_ID = 136817688            # kanal nomidan yuborilgan xabarlar
 
 
 class FloodControl:
@@ -316,8 +345,9 @@ async def is_definitely_admin(context: ContextTypes.DEFAULT_TYPE,
                               user) -> Tuple[bool, str]:
     """Universal admin verification - PRODUCTION READY"""
 
-    # LAYER 0: Anonymous Admin Messages (Telegram official)
-    if user.is_bot and user.username == "GroupAnonymousBot":
+    # LAYER 0: Anonymous Admin Messages (Telegram official).
+    # Username ba'zan bo'sh kelishi mumkin — shuning uchun ID bo'yicha ham tekshiramiz.
+    if user.is_bot and (user.username == "GroupAnonymousBot" or user.id == GROUP_ANONYMOUS_BOT_ID):
         logger.info(f"✅ LAYER 0: Anonymous admin message detected")
         return (True, "anonymous_admin")
 
@@ -897,6 +927,109 @@ def _prune_pm_caches() -> None:
                 removed += 1
     if removed:
         logger.debug(f"PM keshidan {removed} ta eski yozuv tozalandi")
+
+
+# Guruhga bog'langan kanal keshi: {chat_id: (ts, linked_chat_id|None)}
+_linked_chat: Dict[int, tuple] = {}
+_LINKED_CHAT_TTL = 3600
+
+
+async def _get_linked_chat_id(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Optional[int]:
+    """Guruhga bog'langan kanal ID si (muhokama guruhi uchun). Soatiga bir marta so'raladi."""
+    now = asyncio.get_event_loop().time()
+    cached = _linked_chat.get(chat_id)
+    if cached and now - cached[0] < _LINKED_CHAT_TTL:
+        return cached[1]
+    try:
+        info = await context.bot.get_chat(chat_id)
+        linked = getattr(info, 'linked_chat_id', None)
+    except TelegramError as e:
+        logger.debug(f"get_chat({chat_id}) xatosi: {e}")
+        # Xatoda keshni yangilamaymiz — keyingi xabarda qayta urinamiz
+        return cached[1] if cached else None
+    _linked_chat[chat_id] = (now, linked)
+    if linked:
+        logger.info(f"Guruh {chat_id} ga bog'langan kanal: {linked}")
+    return linked
+
+
+async def _check_sender_chat(context: ContextTypes.DEFAULT_TYPE, message) -> Optional[Tuple[bool, str]]:
+    """Xabar KANAL yoki GURUH nomidan yuborilganmi va unga ruxsat bormi.
+
+    Telegram'da bunday xabarlarda `from_user` haqiqiy odam emas — xizmat akkaunti
+    (GroupAnonymousBot yoki Channel_Bot). Shuning uchun oddiy admin tekshiruvi
+    ishlamaydi: get_chat_member o'sha soxta ID ni "a'zo emas" deb qaytaradi va
+    guruh egasining o'z posti ham reklama deb o'chirib yuborilardi.
+
+    None -> sender_chat yo'q, oddiy tekshiruv davom etsin
+    (True, sabab)  -> ruxsat berildi
+    (False, sabab) -> begona kanal
+    """
+    sender_chat = getattr(message, 'sender_chat', None)
+    if sender_chat is None:
+        return None
+
+    chat = message.chat
+
+    # 1. Guruhning O'ZI nomidan — ya'ni anonim admin ("Remain anonymous")
+    if sender_chat.id == chat.id:
+        return (True, "anonim_admin")
+
+    # 2. Bog'langan kanalning posti avtomatik forward bo'lgan (muhokama guruhi)
+    if getattr(message, 'is_automatic_forward', False):
+        return (True, "boglangan_kanal_posti")
+
+    # 3. ALLOWED_CHANNELS ro'yxatidagi kanal
+    if config.is_allowed_channel(sender_chat):
+        return (True, "ruxsat_berilgan_kanal")
+
+    # 4. Guruhga bog'langan kanal nomidan yozilgan
+    linked_id = await _get_linked_chat_id(context, chat.id)
+    if linked_id and sender_chat.id == linked_id:
+        return (True, "boglangan_kanal")
+
+    return (False, "begona_kanal")
+
+
+async def _handle_foreign_channel_message(context: ContextTypes.DEFAULT_TYPE, message) -> None:
+    """Begona kanal nomidan yozilgan xabar.
+
+    Kanalga ogohlantirish berib yoki uni ban qilib bo'lmaydi (u odam emas),
+    shuning uchun faqat reklama bo'lsa xabar o'chiriladi.
+    """
+    chat = message.chat
+    sender_chat = message.sender_chat
+    text = message.text or message.caption or ""
+
+    if not contains_link(text):
+        return
+
+    logger.warning(
+        f"🚫 KANAL REKLAMASI: sender_chat={sender_chat.id} "
+        f"(@{sender_chat.username or '—'}) chat={chat.id}"
+    )
+
+    try:
+        await message.delete()
+    except TelegramError as e:
+        logger.warning(f"Kanal xabarini o'chirib bo'lmadi: {e}")
+        return
+
+    await db.increment_stat('blocked_links')
+    await db.log_activity(sender_chat.id, sender_chat.username, sender_chat.title,
+                          chat.id, chat.title or "Unknown", text, "spam_link", "blocked_channel")
+
+    try:
+        name = escape_markdown(sender_chat.title or sender_chat.username or "Kanal")
+        # message o'chirilgani uchun reply emas, oddiy xabar yuboramiz
+        warning_msg = await context.bot.send_message(
+            chat_id=chat.id,
+            text=f"🚫 **{name}** kanali nomidan yuborilgan reklama o'chirildi.",
+            parse_mode='Markdown'
+        )
+        _schedule_delete(context, warning_msg.chat_id, warning_msg.message_id, config.WARNING_DELETE_DELAY)
+    except TelegramError as e:
+        logger.error(f"Kanal ogohlantirishini yuborib bo'lmadi: {e}")
 
 
 async def _maybe_update_group(context: ContextTypes.DEFAULT_TYPE, chat) -> None:
@@ -1775,6 +1908,23 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     # (har xabarda get_chat/get_chat_member_count chaqirish Telegram rate-limitini buzadi)
     await _maybe_update_group(context, chat)
 
+    # KANAL/GURUH NOMIDAN yuborilgan xabarlar: oddiy admin tekshiruvi ularga ishlamaydi,
+    # chunki from_user — soxta xizmat akkaunti. Shuning uchun alohida tekshiramiz.
+    sender_verdict = await _check_sender_chat(context, message)
+    if sender_verdict is not None:
+        allowed, reason = sender_verdict
+        if allowed:
+            logger.info(
+                f"✅ SENDER_CHAT BYPASS: chat={chat.id}, "
+                f"sender_chat={message.sender_chat.id}, sabab={reason}"
+            )
+            await db.log_activity(message.sender_chat.id, message.sender_chat.username,
+                                  message.sender_chat.title, chat.id, chat.title or "Unknown",
+                                  message_text, "channel_message", f"allowed_via_{reason}")
+            return
+        await _handle_foreign_channel_message(context, message)
+        return
+
     is_admin, verification_method = await is_definitely_admin(context, chat.id, user.id, user)
 
     if is_admin:
@@ -2032,9 +2182,10 @@ async def post_init(application: Application) -> None:
             # Memory leak oldini olish: o'lik guruhlar keshini tozalaymiz
             admin_manager.prune(active_ids)
             active_set = set(active_ids)
-            for cid in list(_group_refresh.keys()):
-                if cid not in active_set:
-                    del _group_refresh[cid]
+            for cache in (_group_refresh, _linked_chat):
+                for cid in list(cache.keys()):
+                    if cid not in active_set:
+                        del cache[cid]
             _prune_pm_caches()
 
         scheduler = AsyncIOScheduler(timezone=UZ_TZ)
