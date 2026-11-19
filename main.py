@@ -4,7 +4,6 @@ import os
 import sys
 import time
 import asyncio
-from aiohttp import web
 
 try:
     from dotenv import load_dotenv
@@ -59,9 +58,6 @@ class Config:
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0") or "0")
     BOT_USERNAME: str = os.getenv("BOT_USERNAME", "")
-    WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
-    WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
-    PORT: int = int(os.getenv("PORT", "8080"))
 
     BASE_DIR: str = field(default_factory=lambda: os.path.dirname(os.path.abspath(__file__)))
     DB_FILE: str = field(init=False)
@@ -158,8 +154,6 @@ class Config:
             raise ValueError("ADMIN_ID is required (yoki ADMIN_IDS)")
         if not self.BOT_USERNAME:
             logger.warning("BOT_USERNAME bo'sh — \"Guruhga qo'shish\" tugmasi ishlamaydi")
-        if self.WEBHOOK_URL and not self.WEBHOOK_SECRET:
-            logger.warning("WEBHOOK_SECRET bo'sh — webhook URL'ni bilgan har kim soxta xabar yuborishi mumkin")
         return True
 
 
@@ -339,6 +333,21 @@ class AdminManager:
 admin_manager = AdminManager()
 
 
+async def get_bot_id(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """Bot ID keshdan olinadi.
+
+    Ilgari har yangi a'zo qo'shilganda get_me() chaqirilardi — bu keraksiz
+    Telegram so'rovi, chunki ID bir marta aniqlansa o'zgarmaydi.
+    """
+    if admin_manager._bot_id is None:
+        try:
+            admin_manager._bot_id = (await context.bot.get_me()).id
+        except TelegramError as e:
+            logger.error(f"Bot ID aniqlanmadi: {e}")
+            return None
+    return admin_manager._bot_id
+
+
 async def is_definitely_admin(context: ContextTypes.DEFAULT_TYPE,
                               chat_id: int,
                               user_id: int,
@@ -348,7 +357,7 @@ async def is_definitely_admin(context: ContextTypes.DEFAULT_TYPE,
     # LAYER 0: Anonymous Admin Messages (Telegram official).
     # Username ba'zan bo'sh kelishi mumkin — shuning uchun ID bo'yicha ham tekshiramiz.
     if user.is_bot and (user.username == "GroupAnonymousBot" or user.id == GROUP_ANONYMOUS_BOT_ID):
-        logger.info(f"✅ LAYER 0: Anonymous admin message detected")
+        logger.info("✅ LAYER 0: Anonymous admin message detected")
         return (True, "anonymous_admin")
 
     # LAYER 1: Bot owner
@@ -1254,7 +1263,7 @@ async def users_count_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             if total_users > 10:
                 text += f"\n... va yana {total_users - 10:,} ta\n"
 
-            text += f"\n💡 To'liq ro'yxat: /users"
+            text += "\n💡 To'liq ro'yxat: /users"
 
         keyboard = [[InlineKeyboardButton("🔙 Admin Panel", callback_data="admin")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -1918,9 +1927,6 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 f"✅ SENDER_CHAT BYPASS: chat={chat.id}, "
                 f"sender_chat={message.sender_chat.id}, sabab={reason}"
             )
-            await db.log_activity(message.sender_chat.id, message.sender_chat.username,
-                                  message.sender_chat.title, chat.id, chat.title or "Unknown",
-                                  message_text, "channel_message", f"allowed_via_{reason}")
             return
         await _handle_foreign_channel_message(context, message)
         return
@@ -1931,7 +1937,6 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         logger.info(f"✅ ADMIN BYPASS: user_id={user.id}, username={user.username}, is_bot={user.is_bot}, chat={chat.id}, method={verification_method}")
 
         await db.update_user(user.id, user.username, user.first_name)
-        await db.log_activity(user.id, user.username, user.first_name, chat.id, chat.title or "Unknown", message_text, "admin_message", f"allowed_via_{verification_method}")
 
         return
 
@@ -2022,26 +2027,10 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         return
 
-    await db.log_activity(user.id, user.username, user.first_name, chat.id, chat.title or "Unknown", message_text, "normal_message", "allowed")
-
-    try:
-        # Baza ulanishi Telegram API chaqiruvidan OLDIN yopiladi —
-        # aks holda tarmoq kutilayotganda butun baza bloklanib turadi
-        is_first_message = False
-        async with db.get_connection() as conn:
-            cursor = await conn.execute('SELECT message_count FROM users WHERE user_id = ?', (user.id,))
-            row = await cursor.fetchone()
-            is_first_message = bool(row and row['message_count'] == 1)
-
-        if is_first_message:
-            user_mention = get_user_mention(user)
-            group_title = escape_markdown(chat.title or "guruh")
-
-            welcome_msg = await message.reply_text(f"👋 Xush kelibsiz, **{user_mention}**!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!\n\n🛡 Bu guruh spam va reklamadan himoyalangan.", parse_mode='Markdown')
-            _schedule_delete(context, welcome_msg.chat_id, welcome_msg.message_id, 15)
-
-    except Exception as e:
-        logger.error(f"Error sending welcome message: {e}")
+    # Oddiy xabarlar bazaga YOZILMAYDI: har xabarga 1 ta INSERT faqat diskni yeydi,
+    # jurnalga esa faqat moderatsiya hodisalari (spam/flood/ban) kerak.
+    # Birinchi xabarda "xush kelibsiz" ham YUBORILMAYDI — odam guruhga kirganda
+    # new_member_handler allaqachon salomlashgan, ikkinchi xabar guruhni axlatlaydi.
 
 
 @error_handler
@@ -2052,15 +2041,17 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat = update.message.chat
     group_title = escape_markdown(chat.title or "guruh")
 
-    bot_info = await context.bot.get_me()
-    bot_added = any(member.id == bot_info.id for member in update.message.new_chat_members)
+    bot_id = await get_bot_id(context)
+    bot_added = bot_id is not None and any(
+        member.id == bot_id for member in update.message.new_chat_members
+    )
 
     if bot_added:
         logger.info(f"🤖 Bot added to group {chat.id} ({group_title}) - refreshing admin list")
         await admin_manager.refresh_admins(context.bot, chat.id)
 
         try:
-            bot_member = await context.bot.get_chat_member(chat.id, bot_info.id)
+            bot_member = await context.bot.get_chat_member(chat.id, bot_id)
 
             if bot_member.status == 'administrator':
                 can_delete = bot_member.can_delete_messages
@@ -2332,79 +2323,13 @@ def main() -> None:
     logger.info("🟢 Bot is running...")
     logger.info("=" * 60)
 
-    if config.WEBHOOK_URL:
-        logger.info(f"🌐 Starting Custom Synchronous Webhook on port {config.PORT}")
-        
-        async def custom_webhook(request: web.Request) -> web.Response:
-            try:
-                # XAVFSIZLIK: Telegram har so'rovda shu sarlavhani yuboradi.
-                # Tekshirmasak — URL'ni bilgan har kim soxta "xabar" yuborib,
-                # bot nomidan buyruq bajartirishi mumkin.
-                if config.WEBHOOK_SECRET:
-                    sent = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
-                    if sent != config.WEBHOOK_SECRET:
-                        logger.warning("🚫 Webhook: noto'g'ri secret token — so'rov rad etildi")
-                        return web.Response(status=403, text="forbidden")
-
-                # 1. Parse update
-                data = await request.json()
-                update = Update.de_json(data, application.bot)
-                
-                # 2. SYNCHRONOUSLY process update before returning 200 OK!
-                # This keeps Cloud Run CPU ALIVE until the bot finishes replying!
-                await application.process_update(update)
-                
-                return web.Response(status=200, text="OK")
-            except Exception as e:
-                logger.error(f"Webhook error: {e}")
-                return web.Response(status=200, text="OK")
-
-        async def health_check(request: web.Request) -> web.Response:
-            return web.Response(status=200, text="Bot is running")
-
-        app = web.Application()
-        app.router.add_post("/", custom_webhook)
-        app.router.add_get("/", health_check)
-
-        # We must manually set the webhook and init the application
-        async def start_server():
-            await application.initialize()
-            await application.start()
-            await application.bot.set_webhook(
-                url=config.WEBHOOK_URL,
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=config.DROP_PENDING_UPDATES,
-                secret_token=config.WEBHOOK_SECRET or None,
-            )
-
-            runner = web.AppRunner(app)
-            await runner.setup()
-            site = web.TCPSite(runner, "0.0.0.0", config.PORT)
-            await site.start()
-            logger.info("✅ Custom Webhook server started successfully!")
-
-            try:
-                # Keep alive
-                while True:
-                    await asyncio.sleep(3600)
-            finally:
-                # Toza yopilish — har qanday holatda resurslar bo'shatiladi
-                await runner.cleanup()
-                await application.stop()
-                await application.shutdown()
-
-        # asyncio.run zamonaviy va deprecated get_event_loop() o'rnini bosadi
-        try:
-            asyncio.run(start_server())
-        except KeyboardInterrupt:
-            pass
-
-    else:
-        logger.info("🔄 Starting long-polling...")
-        # drop_pending_updates=False (default): bot o'chganda kelgan xabarlar ham
-        # ko'rib chiqiladi. Ilgari True edi — o'chiq paytdagi spam e'tiborsiz qolardi.
-        application.run_polling(allowed_updates=Update.ALL_TYPES,
-                                drop_pending_updates=config.DROP_PENDING_UPDATES)
+    logger.info("🔄 Starting long-polling...")
+    # drop_pending_updates=False (default): bot o'chganda kelgan xabarlar ham
+    # ko'rib chiqiladi.
+    # Webhook rejimi yo'q — PTB polling boshlanishida Telegram tomonidagi
+    # webhook'ni o'zi o'chiradi, shuning uchun ziddiyat bo'lmaydi.
+    application.run_polling(allowed_updates=Update.ALL_TYPES,
+                            drop_pending_updates=config.DROP_PENDING_UPDATES)
 
 
 if __name__ == '__main__':

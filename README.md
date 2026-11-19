@@ -29,9 +29,10 @@ venv/bin/python main.py
 ## Server (24/7)
 
 To'liq qo'llanma: [DEPLOY-HETZNER.md](DEPLOY-HETZNER.md) — alohida Linux
-foydalanuvchi, alohida venv, systemd xizmati, hech qanday port ochilmaydi.
+foydalanuvchi, alohida venv, systemd xizmati.
 
-Cloud Run varianti: [DEPLOY.md](DEPLOY.md) (baza vaqtinchalik — tavsiya etilmaydi).
+Bot **faqat long-polling** rejimida ishlaydi: hech qanday port ochilmaydi,
+tashqi web-server kerak emas.
 
 ## Tekshirish
 
@@ -58,7 +59,7 @@ Har biri xabarga **reply** qilib yoki `/unban <ID yoki @username>` shaklida ishl
 |---|---|
 | `/start` | panel va tugmalar |
 | `/users` | foydalanuvchilar ro'yxati |
-| `/activity [soat]` | faoliyat jurnali |
+| `/activity [soat]` | moderatsiya jurnali (o'chirilgan spam/flood) |
 | `/refreshadmins` | admin ro'yxatlarini qayta yuklash |
 | `/cancel` | xabar tarqatishni bekor qilish |
 
@@ -78,6 +79,7 @@ berib bo'lmaydi, shuning uchun faqat xabar o'chadi).
 
 ## Maxfiylik
 
-Oddiy xabarlar matni bazaga **yozilmaydi**. Faqat o'chirilgan spam/flood
-xabarlari dalil sifatida 7 kun saqlanadi (`LOG_MESSAGE_TEXT=true` bilan
-hammasini yoqish mumkin).
+Oddiy xabarlar bazaga **umuman yozilmaydi** — na matni, na yozuvi.
+Jurnalga faqat moderatsiya hodisalari (o'chirilgan spam, flood) tushadi va
+7 kundan keyin avtomatik o'chiriladi (`LOG_MESSAGE_TEXT=true` bilan barcha
+xabar matnini yoqish mumkin).

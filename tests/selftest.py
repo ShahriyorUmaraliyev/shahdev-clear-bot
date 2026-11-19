@@ -135,6 +135,18 @@ class _FakeBot:
         return SimpleNamespace(linked_chat_id=self.linked)
 
 
+class _FakeMeBot:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.me_calls = 0
+
+    async def get_me(self):
+        self.me_calls += 1
+        if self.fail:
+            raise TelegramError('get_me ishlamadi')
+        return SimpleNamespace(id=8557212424)
+
+
 def _ctx(bot):
     return SimpleNamespace(bot=bot)
 
@@ -195,6 +207,23 @@ async def sender_chat_tests():
 
 
 # --------------------------------------------------------------- 4. FloodControl
+async def bot_id_tests():
+    section('Bot ID keshlanadi (get_me bekorga chaqirilmaydi)')
+    m.admin_manager._bot_id = None
+    bot = _FakeMeBot()
+    ctx = _ctx(bot)
+    first = await m.get_bot_id(ctx)
+    check('birinchi chaqiruvda ID olinadi', first, 8557212424)
+    for _ in range(5):
+        await m.get_bot_id(ctx)
+    check('6 chaqiruv -> get_me faqat 1 marta', bot.me_calls, 1)
+
+    m.admin_manager._bot_id = None
+    bad = _FakeMeBot(fail=True)
+    check('get_me xatosi qulatmaydi -> None', await m.get_bot_id(_ctx(bad)), None)
+    m.admin_manager._bot_id = None
+
+
 async def flood_tests():
     section('FloodControl (har guruh alohida hisoblanadi)')
     fc = m.FloodControl(limit=3, window=5)
@@ -292,6 +321,7 @@ async def cache_tests():
 
 async def main_async():
     await sender_chat_tests()
+    await bot_id_tests()
     await flood_tests()
     await db_tests()
     await cache_tests()
