@@ -9,3 +9,4 @@ bot_data.db-wal
 *.backup_*
 main_b64.txt
 .env
+backups/

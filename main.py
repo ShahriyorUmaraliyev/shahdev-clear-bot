@@ -2,6 +2,7 @@ import logging
 import re
 import os
 import sys
+import time
 import asyncio
 from aiohttp import web
 
@@ -27,24 +28,54 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler
 )
-from telegram.error import Forbidden, BadRequest, TelegramError
+from telegram.error import Forbidden, BadRequest, TelegramError, RetryAfter
 from telegram.helpers import escape_markdown
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 UZ_TZ = ZoneInfo('Asia/Tashkent')
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """ENV dan bool o'qish: 1/true/yes/on/ha -> True."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ('1', 'true', 'yes', 'on', 'ha')
+
+
+def _env_ids(name: str) -> set:
+    """ENV dan vergul/bo'shliq bilan ajratilgan ID ro'yxatini o'qish."""
+    out = set()
+    for part in re.split(r'[,\s;]+', os.getenv(name, "") or ""):
+        part = part.strip()
+        if part.lstrip('-').isdigit():
+            out.add(int(part))
+    return out
+
+
 @dataclass
 class Config:
     """Centralized bot configuration"""
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-    ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0"))
+    ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0") or "0")
     BOT_USERNAME: str = os.getenv("BOT_USERNAME", "")
     WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
+    WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
     PORT: int = int(os.getenv("PORT", "8080"))
 
     BASE_DIR: str = field(default_factory=lambda: os.path.dirname(os.path.abspath(__file__)))
     DB_FILE: str = field(init=False)
+    BACKUP_DIR: str = field(init=False)
+    ADMIN_IDS: frozenset = field(init=False)
+
+    # Qo'shimcha adminlar: ADMIN_IDS=111,222 (ADMIN_ID asosiy — bildirishnomalar unga ketadi)
+    # Bot o'chganda kelgan xabarlar tashlab yuborilsinmi (default: YO'Q, hammasi ko'rib chiqiladi)
+    DROP_PENDING_UPDATES: bool = field(default_factory=lambda: _env_bool("DROP_PENDING_UPDATES", False))
+    # Oddiy xabarlar matni bazaga yozilsinmi (default: YO'Q — maxfiylik.
+    # Spam/flood xabarlari dalil sifatida har holda saqlanadi)
+    LOG_MESSAGE_TEXT: bool = field(default_factory=lambda: _env_bool("LOG_MESSAGE_TEXT", False))
+    # Har qanday @username reklama deb hisoblansinmi (default: YO'Q — oddiy tag jazolanmaydi)
+    BLOCK_MENTIONS: bool = field(default_factory=lambda: _env_bool("BLOCK_MENTIONS", False))
 
     MAX_WARNS: int = 3
     MUTE_DURATION_MINUTES: int = 10
@@ -56,21 +87,38 @@ class Config:
 
     DB_TIMEOUT: int = 10
 
+    PM_FLOOD_LIMIT: int = 5
+    PM_FLOOD_WINDOW_SECONDS: int = 10
+    ADMIN_REFRESH_DELAY: float = 0.4
+    BACKUP_KEEP: int = 7
+
     LINK_PATTERNS: Tuple[re.Pattern, ...] = field(default_factory=tuple)
 
     def __post_init__(self):
-        
+
         # DB_PATH env orqali persistent volume (Cloud Run/Docker) ga yo'naltirish mumkin.
         # Cloud Run'da lokal disk vaqtinchalik — baza yo'qolmasligi uchun volume ulang.
         self.DB_FILE = os.getenv("DB_PATH") or os.path.join(self.BASE_DIR, "bot_data.db")
+        self.BACKUP_DIR = os.getenv("BACKUP_DIR") or os.path.join(self.BASE_DIR, "backups")
+
+        # BOT_USERNAME oldidagi "@" ni olib tashlaymiz — aks holda
+        # "https://t.me/@user?startgroup=true" havolasi buziladi
+        self.BOT_USERNAME = (self.BOT_USERNAME or "").strip().lstrip('@')
+
+        ids = _env_ids("ADMIN_IDS")
+        if self.ADMIN_ID:
+            ids.add(self.ADMIN_ID)
+        elif ids:
+            self.ADMIN_ID = sorted(ids)[0]
+        self.ADMIN_IDS = frozenset(ids)
 
         patterns = [
             r'http[s]?://(?:[a-zA-Z0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
             r'www\.[a-zA-Z0-9-]+\.[a-zA-Z]{2,}',
             r't\.me/[a-zA-Z0-9_+]+',
             r'(?:telegram\.me|telegram\.dog)/[a-zA-Z0-9_+]+',
-            # @mention: kamida 5 ta belgi, oldi-orqasi harf/raqam bo'lmasligi (email ichidagi @ tutilmaydi)
-            r'(?<![a-zA-Z0-9_@.])@[a-zA-Z][a-zA-Z0-9_]{4,}\b',
+            # DIQQAT: @mention bu yerda YO'Q. Oddiy "@ali" tagi reklama emas —
+            # u contains_link() ichida reklama konteksti bilan birga tekshiriladi.
             # domen: oldida harf/raqam yo'q (versiya "2.5" yoki "file.com" so'z ichida tutilmaydi),
             # keyin ham qo'shimcha harf bo'lmasligi
             r'(?<![a-zA-Z0-9.@-])[a-zA-Z][a-zA-Z0-9-]{1,}\.(com|net|org|uz|ru|me|io|co|info|online|site|kg|tj)\b',
@@ -83,7 +131,11 @@ class Config:
         if not self.BOT_TOKEN:
             raise ValueError("BOT_TOKEN is required")
         if not self.ADMIN_ID:
-            raise ValueError("ADMIN_ID is required")
+            raise ValueError("ADMIN_ID is required (yoki ADMIN_IDS)")
+        if not self.BOT_USERNAME:
+            logger.warning("BOT_USERNAME bo'sh — \"Guruhga qo'shish\" tugmasi ishlamaydi")
+        if self.WEBHOOK_URL and not self.WEBHOOK_SECRET:
+            logger.warning("WEBHOOK_SECRET bo'sh — webhook URL'ni bilgan har kim soxta xabar yuborishi mumkin")
         return True
 
 
@@ -114,11 +166,16 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 
+def is_bot_admin(user_id: Optional[int]) -> bool:
+    """Bot egasi yoki ADMIN_IDS ro'yxatidagi qo'shimcha adminmi."""
+    return bool(user_id) and user_id in config.ADMIN_IDS
+
+
 def admin_only(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id if update.effective_user else None
-        if user_id != config.ADMIN_ID:
+        if not is_bot_admin(user_id):
             if update.callback_query:
                 await update.callback_query.answer("❌ Sizda ruxsat yo'q!", show_alert=True)
             return
@@ -148,30 +205,35 @@ class FloodControl:
         self._limit = limit
         self._window = window
 
-    async def check(self, user_id: int, is_bot: bool = False, is_admin: bool = False) -> bool:
+    async def check(self, user_id: int, is_bot: bool = False, is_admin: bool = False,
+                    chat_id: Optional[int] = None) -> bool:
         if is_admin or is_bot:
             return False
 
+        # Hisoblagich HAR GURUH uchun alohida: odam 3 xil guruhda bittadan yozsa
+        # bu flood emas (ilgari shunday hisoblanib, xabari o'chirilardi).
+        key = (chat_id, user_id) if chat_id is not None else user_id
+
         now = asyncio.get_event_loop().time()
 
-        if user_id not in self._data:
-            self._data[user_id] = [now]
+        if key not in self._data:
+            self._data[key] = [now]
             return False
 
-        self._data[user_id] = [t for t in self._data[user_id] if now - t < self._window]
-        self._data[user_id].append(now)
+        self._data[key] = [t for t in self._data[key] if now - t < self._window]
+        self._data[key].append(now)
 
-        is_flooding = len(self._data[user_id]) > self._limit
+        is_flooding = len(self._data[key]) > self._limit
 
         if is_flooding:
-            logger.warning(f"🚫 FLOOD: User {user_id} sent {len(self._data[user_id])} messages in {self._window}s")
+            logger.warning(f"🚫 FLOOD: User {user_id} sent {len(self._data[key])} messages in {self._window}s (chat {chat_id})")
 
         return is_flooding
 
     async def cleanup(self) -> int:
         now = asyncio.get_event_loop().time()
         stale_keys = [
-            uid for uid, times in self._data.items()
+            key for key, times in self._data.items()
             if all(now - t >= self._window for t in times)
         ]
         for key in stale_keys:
@@ -188,6 +250,8 @@ class FloodControl:
         }
 
 flood_control = FloodControl(config.FLOOD_LIMIT, config.FLOOD_WINDOW_SECONDS)
+# Shaxsiy chat uchun alohida, yumshoqroq limit — adminning DM'i flood qilinmasligi uchun
+pm_flood_control = FloodControl(config.PM_FLOOD_LIMIT, config.PM_FLOOD_WINDOW_SECONDS)
 
 
 class AdminManager:
@@ -211,7 +275,7 @@ class AdminManager:
             # Network call without global lock!
             admins = await bot.get_chat_administrators(chat_id)
             admin_ids = {admin.user.id for admin in admins}
-            admin_ids.add(config.ADMIN_ID)
+            admin_ids |= set(config.ADMIN_IDS)
 
             self._admins[chat_id] = admin_ids
             self._last_refresh[chat_id] = asyncio.get_event_loop().time()
@@ -224,22 +288,10 @@ class AdminManager:
         finally:
             self._refreshing[chat_id] = False
 
-    async def is_admin(self, context, chat_id: int, user_id: int) -> bool:
-        if user_id == config.ADMIN_ID:
-            return True
-
-        if self._bot_id and user_id == self._bot_id:
-            return True
-
-        last_refresh = self._last_refresh.get(chat_id, 0)
-        now = asyncio.get_event_loop().time()
-
-        if now - last_refresh > self._refresh_interval:
-            # Don't await here directly if we just want to trigger it in background
-            # to prevent holding up the message, but PTB needs it.
-            await self.refresh_admins(context.bot, chat_id)
-
-        return user_id in self._admins.get(chat_id, set())
+    def is_fresh(self, chat_id: int) -> bool:
+        """Kesh hali eskirmaganmi (keraksiz API chaqiruvlarini oldini oladi)."""
+        last = self._last_refresh.get(chat_id, 0)
+        return bool(self._admins.get(chat_id)) and (asyncio.get_event_loop().time() - last) < self._refresh_interval
 
     def prune(self, active_chat_ids) -> None:
         """Faol bo'lmagan guruhlar keshini tozalaydi (memory leak oldini olish)."""
@@ -270,7 +322,7 @@ async def is_definitely_admin(context: ContextTypes.DEFAULT_TYPE,
         return (True, "anonymous_admin")
 
     # LAYER 1: Bot owner
-    if user_id == config.ADMIN_ID:
+    if is_bot_admin(user_id):
         logger.info(f"🔥 LAYER 1: Bot owner {user_id}")
         return (True, "bot_owner")
 
@@ -301,8 +353,8 @@ async def is_definitely_admin(context: ContextTypes.DEFAULT_TYPE,
                         admin_manager._admins[chat_id] = set()
                     admin_manager._admins[chat_id].add(user_id)
                     admin_manager._last_refresh[chat_id] = asyncio.get_event_loop().time()
-            except:
-                pass
+            except Exception as cache_write_error:
+                logger.warning(f"Admin keshiga yozib bo'lmadi: {cache_write_error}")
 
             return (True, "api_fallback")
         else:
@@ -320,14 +372,98 @@ class Database:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._init_lock = asyncio.Lock()
+        self._conn = None
+        self._conn_lock = asyncio.Lock()
+
+    async def _connect(self):
+        conn = await aiosqlite.connect(self.db_path, timeout=config.DB_TIMEOUT)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute('PRAGMA journal_mode=WAL')
+        await conn.execute('PRAGMA synchronous=NORMAL')
+        await conn.execute(f'PRAGMA busy_timeout={config.DB_TIMEOUT * 1000}')
+        return conn
 
     @asynccontextmanager
     async def get_connection(self):
-        async with aiosqlite.connect(self.db_path, timeout=config.DB_TIMEOUT) as conn:
-            conn.row_factory = aiosqlite.Row
-            await conn.execute('PRAGMA journal_mode=WAL')
-            await conn.execute('PRAGMA synchronous=NORMAL')
-            yield conn
+        """BITTA doimiy ulanishni qayta ishlatadi.
+
+        Ilgari har bir amal uchun yangi ulanish ochilardi (bitta guruh xabariga ~4 ta).
+        Ko'p guruhda bu "database is locked" xatolarini keltirib chiqaradi.
+        Lock ketma-ketlikni ta'minlaydi — SQLite baribir yozishni navbatga qo'yadi.
+        DIQQAT: lock qayta kirmaydigan (non-reentrant) — get_connection ichida
+        yana get_connection chaqirmang.
+        """
+        async with self._conn_lock:
+            if self._conn is None:
+                self._conn = await self._connect()
+            try:
+                yield self._conn
+            except Exception:
+                try:
+                    await self._conn.rollback()
+                except Exception:
+                    # Ulanish buzilgan — yopib tashlaymiz, keyingi amalda qaytadan ochiladi
+                    try:
+                        await self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+                raise
+
+    async def close(self) -> None:
+        async with self._conn_lock:
+            if self._conn is not None:
+                try:
+                    await self._conn.close()
+                    logger.info("Baza ulanishi yopildi")
+                except Exception as e:
+                    logger.warning(f"Baza ulanishini yopishda xato: {e}")
+                self._conn = None
+
+    async def backup(self, only_if_older_than: Optional[int] = None) -> Optional[str]:
+        """Bazaning nusxasini oladi (VACUUM INTO — bot ishlab turganda ham xavfsiz).
+
+        Oxirgi config.BACKUP_KEEP ta nusxa saqlanadi, qolganlari o'chiriladi.
+        only_if_older_than berilsa va oxirgi nusxa shundan yangi bo'lsa — hech narsa
+        qilmaydi. Bu bot bir necha marta qayta ishga tushganda kunlik nusxalarning
+        yangi fayllar bilan siqib chiqarilishini oldini oladi.
+        """
+        try:
+            os.makedirs(config.BACKUP_DIR, exist_ok=True)
+
+            if only_if_older_than is not None:
+                existing = [os.path.join(config.BACKUP_DIR, f)
+                            for f in os.listdir(config.BACKUP_DIR)
+                            if f.startswith('bot_data-') and f.endswith('.db')]
+                if existing:
+                    newest = max(os.path.getmtime(p) for p in existing)
+                    if time.time() - newest < only_if_older_than:
+                        logger.info("Backup o'tkazib yuborildi — yaqinda nusxa olingan")
+                        return None
+            stamp = get_uz_time().strftime('%Y%m%d-%H%M%S-%f')
+            dest = os.path.join(config.BACKUP_DIR, f'bot_data-{stamp}.db')
+            if os.path.exists(dest):
+                os.remove(dest)
+
+            # VACUUM tranzaksiya ichida ishlamaydi — alohida autocommit ulanish
+            async with aiosqlite.connect(self.db_path, timeout=config.DB_TIMEOUT,
+                                         isolation_level=None) as conn:
+                await conn.execute('VACUUM INTO ?', (dest,))
+
+            files = sorted(f for f in os.listdir(config.BACKUP_DIR)
+                           if f.startswith('bot_data-') and f.endswith('.db'))
+            for old in (files[:-config.BACKUP_KEEP] if len(files) > config.BACKUP_KEEP else []):
+                try:
+                    os.remove(os.path.join(config.BACKUP_DIR, old))
+                except OSError as e:
+                    logger.warning(f"Eski backup o'chmadi ({old}): {e}")
+
+            size_kb = os.path.getsize(dest) // 1024
+            logger.info(f"Backup olindi: {dest} ({size_kb} KB)")
+            return dest
+        except Exception as e:
+            logger.error(f"Backup olinmadi: {e}")
+            return None
 
     async def init(self) -> None:
         async with self._init_lock:
@@ -443,8 +579,9 @@ class Database:
             async with self.get_connection() as conn:
                 await conn.execute('UPDATE groups SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?', (chat_id,))
                 await conn.commit()
+                logger.info(f"Guruh faolsizlantirildi: {chat_id}")
         except Exception as e:
-            pass
+            logger.error(f"deactivate_group({chat_id}) xatosi: {e}")
 
     async def increment_stat(self, key: str, amount: int = 1) -> None:
         try:
@@ -452,7 +589,7 @@ class Database:
                 await conn.execute('UPDATE stats SET value = value + ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?', (amount, key))
                 await conn.commit()
         except Exception as e:
-            pass
+            logger.error(f"increment_stat({key}) xatosi: {e}")
 
     async def get_active_groups(self):
         try:
@@ -460,7 +597,8 @@ class Database:
                 cursor = await conn.execute('SELECT chat_id, title FROM groups WHERE is_active = 1 ORDER BY title')
                 rows = await cursor.fetchall()
                 return [(row['chat_id'], row['title']) for row in rows]
-        except Exception:
+        except Exception as e:
+            logger.error(f"get_active_groups xatosi: {e}")
             return []
 
     async def get_all_users(self):
@@ -474,7 +612,8 @@ class Database:
                 cursor = await conn.execute('SELECT user_id, username, first_name FROM users WHERE is_banned = 0 AND started_bot = 1 ORDER BY user_id')
                 rows = await cursor.fetchall()
                 return [(row['user_id'], row['username'], row['first_name']) for row in rows]
-        except Exception:
+        except Exception as e:
+            logger.error(f"get_all_users xatosi: {e}")
             return []
 
     async def set_reachable(self, user_id: int, reachable: bool) -> None:
@@ -486,8 +625,8 @@ class Database:
                     (1 if reachable else -1, user_id)
                 )
                 await conn.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"set_reachable({user_id}) xatosi: {e}")
 
     async def mark_user_started(self, user_id: int, username: str, first_name: str) -> None:
         """Foydalanuvchi botni shaxsiy chatda ochganini belgilaydi (broadcast uchun yetib boradigan)."""
@@ -537,23 +676,23 @@ class Database:
                 await conn.execute('UPDATE users SET is_banned = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
                 await conn.commit()
         except Exception as e:
-            pass
+            logger.error(f"ban_user({user_id}) xatosi: {e}")
 
     async def unban_user(self, user_id: int) -> None:
         try:
             async with self.get_connection() as conn:
                 await conn.execute('UPDATE users SET is_banned = 0, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
                 await conn.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"unban_user({user_id}) xatosi: {e}")
 
     async def reset_warnings(self, user_id: int) -> None:
         try:
             async with self.get_connection() as conn:
                 await conn.execute('UPDATE users SET warn_count = 0, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
                 await conn.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"reset_warnings({user_id}) xatosi: {e}")
 
     async def get_stats(self):
         try:
@@ -569,12 +708,17 @@ class Database:
                 stats = {row['key']: row['value'] for row in stats_rows}
 
                 return {'users': users_count, 'groups': groups_count, **stats}
-        except Exception:
+        except Exception as e:
+            logger.error(f"get_stats xatosi: {e}")
             return {'users': 0, 'groups': 0, 'blocked_links': 0, 'banned_users': 0, 'total_messages': 0, 'muted_users': 0, 'total_warnings': 0, 'broadcasts_sent': 0}
 
     async def log_activity(self, user_id, username, first_name, chat_id, chat_title, message_text, message_type, action_taken):
         try:
-            truncated_text = message_text[:500] if message_text else ""
+            # Maxfiylik: oddiy xabarlar matni SAQLANMAYDI.
+            # Faqat spam/flood xabarlari dalil sifatida yoziladi
+            # (LOG_MESSAGE_TEXT=true bo'lsa hammasi yoziladi).
+            keep_text = config.LOG_MESSAGE_TEXT or message_type in ('spam_link', 'flood')
+            truncated_text = (message_text or "")[:500] if keep_text else ""
             async with self.get_connection() as conn:
                 await conn.execute('''
                     INSERT INTO activity_log
@@ -582,8 +726,28 @@ class Database:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (user_id, username, first_name, chat_id, chat_title, truncated_text, message_type, action_taken))
                 await conn.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"log_activity xatosi: {e}")
+
+    async def get_stat(self, key: str, default: int = 0) -> int:
+        try:
+            async with self.get_connection() as conn:
+                row = await (await conn.execute('SELECT value FROM stats WHERE key = ?', (key,))).fetchone()
+                return row['value'] if row else default
+        except Exception as e:
+            logger.error(f"get_stat({key}) xatosi: {e}")
+            return default
+
+    async def set_stat(self, key: str, value: int) -> None:
+        try:
+            async with self.get_connection() as conn:
+                await conn.execute('''
+                    INSERT INTO stats (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+                ''', (key, value))
+                await conn.commit()
+        except Exception as e:
+            logger.error(f"set_stat({key}) xatosi: {e}")
 
     async def get_recent_activity(self, hours: int = 1, limit: int = 50):
         try:
@@ -596,7 +760,8 @@ class Database:
                 ''', (f'-{hours}', limit))
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
-        except Exception:
+        except Exception as e:
+            logger.error(f"get_recent_activity xatosi: {e}")
             return []
 
     async def cleanup_old_activity(self, days: int = 7) -> int:
@@ -609,7 +774,8 @@ class Database:
                 deleted = cursor.rowcount
                 await conn.commit()
                 return deleted
-        except Exception:
+        except Exception as e:
+            logger.error(f"cleanup_old_activity xatosi: {e}")
             return 0
 
 
@@ -638,10 +804,55 @@ def format_uz_time(dt: datetime = None, format_str: str = '%d.%m.%Y %H:%M:%S') -
     return dt.strftime(format_str)
 
 
+# @username: 5-32 belgi. Oldida harf/raqam/nuqta bo'lmasligi -> email ichidagi @ tutilmaydi.
+MENTION_RE = re.compile(r'(?<![a-zA-Z0-9_@./])@([a-zA-Z][a-zA-Z0-9_]{4,31})\b')
+
+# Reklama konteksti: @mention FAQAT shu so'zlar bilan birga kelganda spam hisoblanadi.
+# Shunday qilib guruhda odamlar bir-birini "@ali" deb chaqirsa jazolanmaydi.
+PROMO_CONTEXT_RE = re.compile(
+    r'(kanal|kanalim|kanalga|obuna|subscri|join\s|guruhim|guruhga\s*kir|'
+    r'reklama|aksiya|chegirma|promo\s?kod|bepul\s*(kurs|darslik|kitob)|'
+    r'pul\s*ishla|daromad|investitsiya|kazino|casino|stavka|bukmeker|'
+    r'yozila|buyurtma|zakaz|sotiladi|arzon\s*narx)',
+    re.IGNORECASE
+)
+
+
+def _is_promo_mention(text: str) -> bool:
+    """@mention reklamaga o'xshaydimi.
+
+    MUHIM: ilgari har qanday @username (5+ belgi) reklama deb bloklanardi —
+    "Salom @Shahriyor qalaysan" ham ban olib kelardi. Endi faqat:
+      - reklama konteksti bo'lsa (kanal/obuna/reklama/...), yoki
+      - bitta xabarda 3+ mention bo'lsa (mention-spam), yoki
+      - BLOCK_MENTIONS=true qo'yilgan bo'lsa.
+    """
+    mentions = [m for m in MENTION_RE.findall(text)
+                if m.lower() != (config.BOT_USERNAME or '').lower()]
+    if not mentions:
+        return False
+    if config.BLOCK_MENTIONS:
+        return True
+    if len(mentions) >= 3:
+        return True
+    return bool(PROMO_CONTEXT_RE.search(text))
+
+
 def contains_link(text: str) -> bool:
     if not text:
         return False
-    return any(pattern.search(text) for pattern in config.LINK_PATTERNS)
+    if any(pattern.search(text) for pattern in config.LINK_PATTERNS):
+        return True
+    return _is_promo_mention(text)
+
+
+def _schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int) -> None:
+    """Xabarni delay sekunddan keyin o'chirish. job_queue yo'q bo'lsa ham qulamaydi."""
+    job_queue = getattr(context, 'job_queue', None)
+    if job_queue is None:
+        logger.warning("job_queue mavjud emas — xabar avtomatik o'chirilmaydi")
+        return
+    job_queue.run_once(delete_message_job, delay, data={'chat_id': chat_id, 'message_id': message_id})
 
 
 async def delete_message_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -659,6 +870,34 @@ _GROUP_REFRESH_INTERVAL = 3600  # 1 soat
 _pm_notify_ts: Dict[int, float] = {}
 _PM_NOTIFY_INTERVAL = 300  # har userdan info-header eng ko'pi 5 daqiqada bir marta
 
+# Shaxsiy chatda flood ogohlantirishi throttle keshi: {user_id: last_warn_ts}
+_pm_flood_warn_ts: Dict[int, float] = {}
+_PM_FLOOD_WARN_INTERVAL = 60
+
+# Kesh yoshi: eski yozuvlar tozalanadi (xotira oqishini oldini olish)
+_PM_CACHE_TTL = 86400
+
+# Kritik xato haqida adminga ogohlantirish throttle'i (restart loop'da spam bo'lmasligi uchun)
+_critical_alert_ts = 0.0
+_CRITICAL_ALERT_INTERVAL = 600
+
+
+def _prune_pm_caches() -> None:
+    """_pm_notify_ts va _pm_flood_warn_ts keshlarini tozalaydi.
+
+    Ilgari _pm_notify_ts HECH QACHON tozalanmasdi — botga yozgan har bir odam
+    xotirada abadiy qolardi (sekin xotira oqishi).
+    """
+    now = asyncio.get_event_loop().time()
+    removed = 0
+    for cache in (_pm_notify_ts, _pm_flood_warn_ts):
+        for uid, ts in list(cache.items()):
+            if now - ts > _PM_CACHE_TTL:
+                del cache[uid]
+                removed += 1
+    if removed:
+        logger.debug(f"PM keshidan {removed} ta eski yozuv tozalandi")
+
 
 async def _maybe_update_group(context: ContextTypes.DEFAULT_TYPE, chat) -> None:
     """Guruhni DB ga yozadi. member_count uchun API ni faqat soatiga bir marta chaqiradi."""
@@ -671,8 +910,10 @@ async def _maybe_update_group(context: ContextTypes.DEFAULT_TYPE, chat) -> None:
             member_count = await context.bot.get_chat_member_count(chat.id)
             await db.update_group(chat.id, chat.title or "Unknown", member_count)
             return
-        except TelegramError:
-            pass
+        except TelegramError as e:
+            # Xato bo'lsa bir soat kutmaymiz — 5 daqiqadan keyin qayta urinamiz
+            _group_refresh[chat.id] = now - _GROUP_REFRESH_INTERVAL + 300
+            logger.debug(f"get_chat_member_count({chat.id}) xatosi: {e}")
 
     # Tez-tez: API siz, faqat title yangilanadi (mavjud member_count saqlanadi)
     await db.update_group(chat.id, chat.title or "Unknown")
@@ -744,7 +985,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             [InlineKeyboardButton("ℹ️ Yordam", callback_data="help")]
         ]
 
-        if user.id == config.ADMIN_ID:
+        if is_bot_admin(user.id):
             keyboard.append([InlineKeyboardButton("📊 Admin Panel", callback_data="admin")])
 
         await message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -1001,7 +1242,7 @@ async def back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         [InlineKeyboardButton("ℹ️ Yordam", callback_data="help")]
     ]
 
-    if user.id == config.ADMIN_ID:
+    if is_bot_admin(user.id):
         keyboard.append([InlineKeyboardButton("📊 Admin Panel", callback_data="admin")])
 
     try:
@@ -1032,7 +1273,8 @@ async def activity_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     for i, act in enumerate(activities[:20], 1):
         username = act['username'] or act['first_name'] or "Unknown"
         action = act['action_taken']
-        msg_preview = act['message_text'][:30] + "..." if len(act['message_text']) > 30 else act['message_text']
+        raw_text = act['message_text'] or "—"
+        msg_preview = (raw_text[:30] + "...") if len(raw_text) > 30 else raw_text
         try:
             ts = act['timestamp']
             dt_utc = ts if isinstance(ts, datetime) else datetime.strptime(str(ts).split('.')[0], '%Y-%m-%d %H:%M:%S')
@@ -1165,8 +1407,8 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 row = await (await conn.execute('SELECT user_id FROM users WHERE username = ?', (arg,))).fetchone()
                 if row:
                     return row['user_id'], f"@{escape_markdown(arg)}"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"_resolve_target username qidirish xatosi: {e}")
     return None, None
 
 
@@ -1237,7 +1479,7 @@ async def unmute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 @error_handler
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or update.message.from_user.id != config.ADMIN_ID:
+    if not update.message or not is_bot_admin(update.message.from_user.id):
         return
 
     if context.user_data.get('broadcast_mode'):
@@ -1253,11 +1495,25 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
     user = update.message.from_user
     message = update.message
 
+    # FLOOD HIMOYASI (shaxsiy chat). Ilgari bu yerda hech qanday limit yo'q edi:
+    # istalgan odam adminning shaxsiy chatini minglab xabar bilan to'ldirib,
+    # botni Telegram rate-limitiga uchratishi mumkin edi (bu paytda guruhlarda ham ishlamaydi).
+    if not is_bot_admin(user.id) and await pm_flood_control.check(user.id):
+        now = asyncio.get_event_loop().time()
+        if now - _pm_flood_warn_ts.get(user.id, 0) > _PM_FLOOD_WARN_INTERVAL:
+            _pm_flood_warn_ts[user.id] = now
+            try:
+                await message.reply_text("⏳ Juda tez yozyapsiz. Iltimos sekinroq — aks holda xabarlaringiz yetib bormaydi.")
+            except TelegramError:
+                pass
+        logger.warning(f"🚫 PM FLOOD: user {user.id} xabari adminga yuborilmadi")
+        return
+
     await db.update_user(user.id, user.username, user.first_name)
     # Shaxsiy chatga yozgan — botni ochgan, broadcast yetib boradigan user
     await db.mark_user_started(user.id, user.username, user.first_name)
 
-    if user.id != config.ADMIN_ID:
+    if not is_bot_admin(user.id):
         try:
             # Info-header (kim yozayotgani) faqat 5 daqiqada bir marta — admin chati spamlanmaydi.
             # Xabarning o'zi har doim forward qilinadi.
@@ -1304,6 +1560,70 @@ async def run_broadcast_task(bot, from_chat_id, message_id, broadcast_mode, user
             user_data['broadcast_running'] = False
 
 
+# Manba xabarga tegishli xatolar — HAR BIR manzil uchun qaytadi.
+_SOURCE_ERROR_MARKERS = (
+    'message to copy not found', 'message to forward not found',
+    'message_id_invalid', 'message identifier is not specified',
+    "message can't be copied", 'message is too long',
+    'message text is empty', 'media_empty',
+)
+
+# Manzil haqiqatan yo'q / botni bloklagan — ro'yxatdan chiqarish o'rinli.
+_DEAD_TARGET_MARKERS = (
+    'chat not found', 'bot was kicked', 'bot is not a member',
+    'user is deactivated', 'bot was blocked by the user',
+    "can't initiate conversation", "can't talk to bots",
+    'user not found', 'peer_id_invalid', 'chat_write_forbidden',
+    'group chat was deactivated', 'the group chat was deleted',
+)
+
+
+def _classify_broadcast_error(err) -> str:
+    """Broadcast xatosining turini aniqlaydi.
+
+    'source'    — muammo YUBORILAYOTGAN xabarda (masalan admin uni o'chirib yuborgan).
+                  Bu xato har bir manzil uchun qaytadi. Ilgari shu holatda BARCHA
+                  guruhlar bazadan faolsizlantirilardi — bitta xato butun ro'yxatni
+                  o'chirardi. Endi hech narsa o'chirilmaydi, tarqatish to'xtatiladi.
+    'dead'      — manzil haqiqatan yo'q yoki botni bloklagan.
+    'transient' — vaqtinchalik xato: hech narsa o'chirilmaydi.
+    """
+    msg = str(err).lower()
+    if any(m in msg for m in _SOURCE_ERROR_MARKERS):
+        return 'source'
+    if any(m in msg for m in _DEAD_TARGET_MARKERS):
+        return 'dead'
+    if isinstance(err, Forbidden):
+        return 'dead'
+    return 'transient'
+
+
+async def _report_broadcast_abort(status_message, reason: str, sent: int = 0, total: int = 0) -> None:
+    text = (
+        "🛑 **XABAR TARQATISH TO'XTATILDI**\n\n"
+        "Yuborilayotgan xabarning o'zida muammo bor (o'chirilgan yoki nusxalab bo'lmaydi).\n\n"
+        f"📤 To'xtashdan oldin yuborilgan: **{sent}/{total}**\n"
+        "✅ **Hech bir guruh/foydalanuvchi ro'yxatdan chiqarilmadi.**\n\n"
+        "Xabarni qayta yuborib ko'ring.\n\n"
+        f"`{escape_markdown(reason[:200])}`"
+    )
+    try:
+        await status_message.edit_text(text, parse_mode='Markdown')
+    except TelegramError as e:
+        logger.error(f"Abort hisobotini yuborib bo'lmadi: {e}")
+
+
+async def _broadcast_send(bot, target_id, from_chat_id, message_id) -> None:
+    """Bitta manzilga yuboradi. Telegram rate-limit so'rasa kutib bir marta qayta uriniladi."""
+    try:
+        await bot.copy_message(chat_id=target_id, from_chat_id=from_chat_id, message_id=message_id)
+    except RetryAfter as e:
+        wait = min(float(getattr(e, 'retry_after', 5) or 5) + 1, 60)
+        logger.warning(f"⏳ Rate limit: {wait:.0f}s kutib qayta urinamiz ({target_id})")
+        await asyncio.sleep(wait)
+        await bot.copy_message(chat_id=target_id, from_chat_id=from_chat_id, message_id=message_id)
+
+
 async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
     groups = []
     users = []
@@ -1326,17 +1646,24 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
     fail_count = 0
     failed_list = []
     last_update_time = asyncio.get_event_loop().time()
+    abort_reason = None
 
     for index, (chat_id, title) in enumerate(groups, 1):
         try:
-            await bot.copy_message(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id)
+            await _broadcast_send(bot, chat_id, from_chat_id, message_id)
             success_count += 1
             logger.info(f"Broadcast sent to group {title} ({chat_id})")
         except (Forbidden, BadRequest) as e:
+            kind = _classify_broadcast_error(e)
             fail_count += 1
             failed_list.append(('group', title, str(e)))
-            await db.deactivate_group(chat_id)
-            logger.warning(f"Failed to send to group {title}: {e}")
+            if kind == 'source':
+                abort_reason = str(e)
+                logger.error(f"🛑 Broadcast to'xtatildi — manba xabarda muammo: {e}")
+                break
+            if kind == 'dead':
+                await db.deactivate_group(chat_id)
+            logger.warning(f"Failed to send to group {title} ({kind}): {e}")
         except TelegramError as e:
             fail_count += 1
             failed_list.append(('group', title, str(e)))
@@ -1352,19 +1679,31 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
 
         await asyncio.sleep(config.BROADCAST_DELAY)
 
+    if abort_reason:
+        await _report_broadcast_abort(status_message, abort_reason, success_count, total)
+        return
+
     for index, (user_id, username, first_name) in enumerate(users, len(groups) + 1):
         try:
-            await bot.copy_message(chat_id=user_id, from_chat_id=from_chat_id, message_id=message_id)
+            await _broadcast_send(bot, user_id, from_chat_id, message_id)
             success_count += 1
             # Yetdi — 'reachable' deb belgilaymiz (keyingi broadcastlarda tez topiladi)
             await db.set_reachable(user_id, True)
             logger.info(f"Broadcast sent to user {username or first_name} ({user_id})")
         except (Forbidden, BadRequest) as e:
+            kind = _classify_broadcast_error(e)
             fail_count += 1
-            # Yetib bo'lmadi (bloklangan/start qilmagan) — 'o'lik' deb belgilaymiz, qayta urinilmaydi
-            await db.set_reachable(user_id, False)
             failed_list.append(('user', username or first_name or str(user_id), str(e)))
-            logger.warning(f"Failed to send to user {user_id}: {e}")
+            if kind == 'source':
+                abort_reason = str(e)
+                logger.error(f"🛑 Broadcast to'xtatildi — manba xabarda muammo: {e}")
+                break
+            if kind == 'dead':
+                # Haqiqatan yetib bo'lmaydi — ro'yxatdan chiqaramiz.
+                # Vaqtinchalik xatoda ESA chiqarmaymiz (ilgari chiqarilardi va
+                # odam boshqa hech qachon xabar olmasdi).
+                await db.set_reachable(user_id, False)
+            logger.warning(f"Failed to send to user {user_id} ({kind}): {e}")
         except TelegramError as e:
             fail_count += 1
             failed_list.append(('user', username or first_name or str(user_id), str(e)))
@@ -1379,6 +1718,10 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
                 pass
 
         await asyncio.sleep(config.BROADCAST_DELAY)
+
+    if abort_reason:
+        await _report_broadcast_abort(status_message, abort_reason, success_count, total)
+        return
 
     await db.increment_stat('broadcasts_sent', success_count)
 
@@ -1457,7 +1800,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     await db.update_user(user.id, user.username, user.first_name)
 
-    if await flood_control.check(user.id, is_bot=user.is_bot, is_admin=is_admin):
+    if await flood_control.check(user.id, is_bot=user.is_bot, is_admin=is_admin, chat_id=chat.id):
         try:
             logger.warning(f"🚫 FLOOD DETECTED: user {user.id} in chat {chat.id}")
 
@@ -1467,7 +1810,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             user_mention = get_user_mention(user)
             warning_msg = await message.reply_text(f"⚠️ **{user_mention}**\n\n🚫 Flooding taqiqlanadi! Iltimos, sekinroq yozing.", parse_mode='Markdown')
 
-            context.job_queue.run_once(delete_message_job, config.WARNING_DELETE_DELAY, data={'chat_id': warning_msg.chat_id, 'message_id': warning_msg.message_id})
+            _schedule_delete(context, warning_msg.chat_id, warning_msg.message_id, config.WARNING_DELETE_DELAY)
         except TelegramError as e:
             logger.error(f"Error handling flood: {e}")
 
@@ -1491,7 +1834,13 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             user_mention = get_user_mention(user)
             group_title = escape_markdown(chat.title or "guruhda")
 
-            if warn_count >= config.MAX_WARNS:
+            if warn_count <= 0:
+                # Baza yozmadi — ogohlantirish soni noma'lum. Jazo (mute/ban) QO'LLANMAYDI.
+                # Ilgari bu holatda foydalanuvchi "0/3 OGOHLANTIRISH" xabarini ko'rardi.
+                logger.error(f"add_warning bazaga yozilmadi (user {user.id}) — jazo qo'llanmadi")
+                warning_msg = await message.reply_text(f"⚠️ **{user_mention}**\n\n🚫 Reklama o'chirildi!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!", parse_mode='Markdown')
+
+            elif warn_count >= config.MAX_WARNS:
                 warning_msg = await message.reply_text(f"⛔ **{user_mention}**\n\n❌ **{warn_count}/{config.MAX_WARNS} OGOHLANTIRISH** — BAN!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!", parse_mode='Markdown')
 
                 try:
@@ -1516,7 +1865,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             else:
                 warning_msg = await message.reply_text(f"⚠️ **{user_mention}**\n\n🚫 **{warn_count}/{config.MAX_WARNS} OGOHLANTIRISH**\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!", parse_mode='Markdown')
 
-            context.job_queue.run_once(delete_message_job, config.WARNING_DELETE_DELAY, data={'chat_id': warning_msg.chat_id, 'message_id': warning_msg.message_id})
+            _schedule_delete(context, warning_msg.chat_id, warning_msg.message_id, config.WARNING_DELETE_DELAY)
 
         except TelegramError as e:
             logger.error(f"Error handling link spam: {e}")
@@ -1526,17 +1875,20 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await db.log_activity(user.id, user.username, user.first_name, chat.id, chat.title or "Unknown", message_text, "normal_message", "allowed")
 
     try:
+        # Baza ulanishi Telegram API chaqiruvidan OLDIN yopiladi —
+        # aks holda tarmoq kutilayotganda butun baza bloklanib turadi
+        is_first_message = False
         async with db.get_connection() as conn:
             cursor = await conn.execute('SELECT message_count FROM users WHERE user_id = ?', (user.id,))
             row = await cursor.fetchone()
+            is_first_message = bool(row and row['message_count'] == 1)
 
-            if row and row['message_count'] == 1:
-                user_mention = get_user_mention(user)
-                group_title = escape_markdown(chat.title or "guruh")
+        if is_first_message:
+            user_mention = get_user_mention(user)
+            group_title = escape_markdown(chat.title or "guruh")
 
-                welcome_msg = await message.reply_text(f"👋 Xush kelibsiz, **{user_mention}**!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!\n\n🛡 Bu guruh spam va reklamadan himoyalangan.", parse_mode='Markdown')
-
-                context.job_queue.run_once(delete_message_job, 15, data={'chat_id': welcome_msg.chat_id, 'message_id': welcome_msg.message_id})
+            welcome_msg = await message.reply_text(f"👋 Xush kelibsiz, **{user_mention}**!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!\n\n🛡 Bu guruh spam va reklamadan himoyalangan.", parse_mode='Markdown')
+            _schedule_delete(context, welcome_msg.chat_id, welcome_msg.message_id, 15)
 
     except Exception as e:
         logger.error(f"Error sending welcome message: {e}")
@@ -1571,7 +1923,7 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 setup_msg = await update.message.reply_text("❌ **Bot admin emas!**\n\n⚠️ **MUHIM:** Guruh to'liq ishlashi uchun botni **ADMIN** qiling!", parse_mode='Markdown')
 
-            context.job_queue.run_once(delete_message_job, 60, data={'chat_id': setup_msg.chat_id, 'message_id': setup_msg.message_id})
+            _schedule_delete(context, setup_msg.chat_id, setup_msg.message_id, 60)
 
         except TelegramError as e:
             logger.error(f"Error sending setup instructions: {e}")
@@ -1584,7 +1936,7 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         try:
             welcome_msg = await update.message.reply_text(f"👋 Xush kelibsiz, **{user_mention}**!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!\n\n🛡 Bu guruh spam va reklamadan himoyalangan.", parse_mode='Markdown')
-            context.job_queue.run_once(delete_message_job, 15, data={'chat_id': welcome_msg.chat_id, 'message_id': welcome_msg.message_id})
+            _schedule_delete(context, welcome_msg.chat_id, welcome_msg.message_id, 15)
         except TelegramError as e:
             logger.error(f"Error sending welcome message: {e}")
 
@@ -1612,48 +1964,90 @@ async def post_init(application: Application) -> None:
         except Exception as e:
             logger.error(f"Could not cache bot ID: {e}")
 
-        logger.info("🔄 Refreshing admin lists...")
         groups = await db.get_active_groups()
-        refresh_count = 0
-        for chat_id, title in groups:
-            try:
-                success = await admin_manager.refresh_admins(application.bot, chat_id)
-                if success:
-                    refresh_count += 1
-            except Exception as e:
-                logger.warning(f"Could not refresh admins for {title}: {e}")
 
-        logger.info(f"✅ Admin lists refreshed for {refresh_count}/{len(groups)} groups")
+        async def _initial_admin_refresh():
+            """Admin ro'yxatlarini FONDA yuklaydi.
 
+            Guruhlar orasida pauza bor (Telegram rate-limit). Fonda bajarilgani uchun
+            100 ta guruhda ham bot darhol ishlashni boshlaydi, kutib turmaydi.
+            """
+            refreshed = 0
+            for chat_id, title in groups:
+                try:
+                    if await admin_manager.refresh_admins(application.bot, chat_id):
+                        refreshed += 1
+                except Exception as e:
+                    logger.warning(f"Could not refresh admins for {title}: {e}")
+                await asyncio.sleep(config.ADMIN_REFRESH_DELAY)
+            logger.info(f"✅ Admin lists refreshed for {refreshed}/{len(groups)} groups")
+
+        logger.info(f"🔄 Admin ro'yxatlari fonda yuklanmoqda ({len(groups)} guruh)...")
+        # Task'ga havola saqlanadi — aks holda garbage-collect bo'lib ketishi mumkin
+        application.bot_data['initial_refresh_task'] = asyncio.create_task(_initial_admin_refresh())
+
+        # Startup xabari: agar bot qayta-qayta qulab tushsa (Restart=always),
+        # admin har 5 sekundda xabar olmasligi uchun 10 daqiqalik throttle.
         try:
-            startup_msg = f"🚀 **BOT ISHGA TUSHDI**\n\n✅ Guruhlar: {len(groups)} ta\n✅ Adminlar: {refresh_count} guruhda yuklandi\n⏰ {format_uz_time()}\n\nBot muvaffaqiyatli ishga tushdi."
-            await application.bot.send_message(chat_id=config.ADMIN_ID, text=startup_msg, parse_mode='Markdown')
-            logger.info("✅ Startup notification sent")
+            now_ts = int(datetime.now(tz=ZoneInfo('UTC')).timestamp())
+            last_notify = await db.get_stat('last_startup_notify')
+            if now_ts - last_notify > 600:
+                await db.set_stat('last_startup_notify', now_ts)
+                startup_msg = f"🚀 **BOT ISHGA TUSHDI**\n\n✅ Guruhlar: {len(groups)} ta\n✅ Adminlar fonda yuklanmoqda\n⏰ {format_uz_time()}\n\nBot muvaffaqiyatli ishga tushdi."
+                await application.bot.send_message(chat_id=config.ADMIN_ID, text=startup_msg, parse_mode='Markdown')
+                logger.info("✅ Startup notification sent")
+            else:
+                logger.warning("⚠️ Startup xabari yuborilmadi — bot yaqinda allaqachon ishga tushgan (restart loop?)")
         except Exception as e:
             logger.warning(f"Could not send startup notification: {e}")
 
         async def cleanup_activity_job():
-            await db.cleanup_old_activity(days=7)
+            deleted = await db.cleanup_old_activity(days=7)
+            if deleted:
+                logger.info(f"🧹 Activity log: {deleted} ta eski yozuv o'chirildi")
+
+        async def backup_job():
+            await db.backup()
 
         async def refresh_all_admins():
             groups = await db.get_active_groups()
             active_ids = [chat_id for chat_id, _ in groups]
+            refreshed = 0
             for chat_id in active_ids:
+                # Keshi hali yangi bo'lsa API ni bezovta qilmaymiz
+                if admin_manager.is_fresh(chat_id):
+                    continue
                 try:
-                    await admin_manager.refresh_admins(application.bot, chat_id)
-                except Exception:
-                    pass
+                    if await admin_manager.refresh_admins(application.bot, chat_id):
+                        refreshed += 1
+                except Exception as e:
+                    logger.warning(f"Admin yangilash xatosi (chat {chat_id}): {e}")
+                # MUHIM: guruhlar orasida pauza. Ilgari pauza yo'q edi va 100 guruhda
+                # har 10 daqiqada 100 ta so'rov birdan ketib, Telegram flood deb hisoblardi.
+                await asyncio.sleep(config.ADMIN_REFRESH_DELAY)
+
+            if refreshed:
+                logger.info(f"🔄 Adminlar yangilandi: {refreshed} guruh")
+
             # Memory leak oldini olish: o'lik guruhlar keshini tozalaymiz
             admin_manager.prune(active_ids)
+            active_set = set(active_ids)
             for cid in list(_group_refresh.keys()):
-                if cid not in set(active_ids):
+                if cid not in active_set:
                     del _group_refresh[cid]
+            _prune_pm_caches()
 
-        scheduler = AsyncIOScheduler()
+        scheduler = AsyncIOScheduler(timezone=UZ_TZ)
         scheduler.add_job(cleanup_flood_data, 'interval', minutes=config.FLOOD_CLEANUP_MINUTES)
         scheduler.add_job(cleanup_activity_job, 'interval', hours=24)
         scheduler.add_job(refresh_all_admins, 'interval', minutes=10)
+        # Har kuni 03:17 da bazaning nusxasi olinadi (oxirgi BACKUP_KEEP ta saqlanadi)
+        scheduler.add_job(backup_job, 'cron', hour=3, minute=17)
         scheduler.start()
+
+        # Ishga tushganda nusxa olamiz, lekin faqat oxirgisi 6 soatdan eski bo'lsa —
+        # tez-tez restart kunlik nusxalarni o'chirib yubormasligi uchun
+        await db.backup(only_if_older_than=6 * 3600)
 
         # Scheduler garbage-collect bo'lib ketmasligi uchun application'da saqlaymiz
         application.bot_data['scheduler'] = scheduler
@@ -1664,6 +2058,18 @@ async def post_init(application: Application) -> None:
     except Exception as e:
         logger.exception(f"❌ Error during initialization: {e}")
         sys.exit(1)
+
+
+async def post_shutdown(application: Application) -> None:
+    """Bot to'xtaganda scheduler va baza ulanishini tartibli yopadi."""
+    scheduler = application.bot_data.get('scheduler')
+    if scheduler is not None:
+        try:
+            scheduler.shutdown(wait=False)
+            logger.info("✅ Scheduler to'xtatildi")
+        except Exception as e:
+            logger.warning(f"Scheduler to'xtatishda xato: {e}")
+    await db.close()
 
 
 async def error_callback(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1689,6 +2095,14 @@ async def error_callback(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
     if is_critical:
         # InvalidToken/Unauthorized — bot ishlay olmaydi, AVTOMATIK tiklanmaydi. Aniq ERROR.
         logger.error(f"🚨 KRITIK: {error_type} - {error_msg} — bot token/ruxsatini tekshiring!")
+
+        # Throttle: bir xil kritik xato takrorlanganda admin chati spamlanmasligi uchun
+        global _critical_alert_ts
+        now = asyncio.get_event_loop().time()
+        if now - _critical_alert_ts < _CRITICAL_ALERT_INTERVAL:
+            return
+        _critical_alert_ts = now
+
         try:
             alert_text = (
                 f"🚨 **KRITIK BOT XATOLIGI**\n\n"
@@ -1714,15 +2128,19 @@ def main() -> None:
         logger.error(f"❌ Configuration error: {e}")
         sys.exit(1)
 
-    logger.info(f"✅ Admin ID: {config.ADMIN_ID}")
+    logger.info(f"✅ Admin ID: {config.ADMIN_ID} (jami adminlar: {len(config.ADMIN_IDS)})")
     logger.info(f"✅ Bot Username: {config.BOT_USERNAME}")
     logger.info(f"✅ Database: {config.DB_FILE}")
+    logger.info(f"✅ Backup: {config.BACKUP_DIR} (oxirgi {config.BACKUP_KEEP} ta)")
+    logger.info(f"✅ @mention bloklash: {'HA' if config.BLOCK_MENTIONS else 'YO\'Q (faqat reklama konteksti)'}")
+    logger.info(f"✅ Xabar matnini log qilish: {'HA' if config.LOG_MESSAGE_TEXT else 'YO\'Q (maxfiylik)'}")
     logger.info("🔍 Bot will auto-clear conflicts on startup...")
 
     application = (
         Application.builder()
         .token(config.BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .read_timeout(30)
         .write_timeout(30)
         .connect_timeout(30)
@@ -1768,6 +2186,15 @@ def main() -> None:
         
         async def custom_webhook(request: web.Request) -> web.Response:
             try:
+                # XAVFSIZLIK: Telegram har so'rovda shu sarlavhani yuboradi.
+                # Tekshirmasak — URL'ni bilgan har kim soxta "xabar" yuborib,
+                # bot nomidan buyruq bajartirishi mumkin.
+                if config.WEBHOOK_SECRET:
+                    sent = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
+                    if sent != config.WEBHOOK_SECRET:
+                        logger.warning("🚫 Webhook: noto'g'ri secret token — so'rov rad etildi")
+                        return web.Response(status=403, text="forbidden")
+
                 # 1. Parse update
                 data = await request.json()
                 update = Update.de_json(data, application.bot)
@@ -1792,7 +2219,12 @@ def main() -> None:
         async def start_server():
             await application.initialize()
             await application.start()
-            await application.bot.set_webhook(url=config.WEBHOOK_URL, allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            await application.bot.set_webhook(
+                url=config.WEBHOOK_URL,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=config.DROP_PENDING_UPDATES,
+                secret_token=config.WEBHOOK_SECRET or None,
+            )
 
             runner = web.AppRunner(app)
             await runner.setup()
@@ -1818,7 +2250,10 @@ def main() -> None:
 
     else:
         logger.info("🔄 Starting long-polling...")
-        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        # drop_pending_updates=False (default): bot o'chganda kelgan xabarlar ham
+        # ko'rib chiqiladi. Ilgari True edi — o'chiq paytdagi spam e'tiborsiz qolardi.
+        application.run_polling(allowed_updates=Update.ALL_TYPES,
+                                drop_pending_updates=config.DROP_PENDING_UPDATES)
 
 
 if __name__ == '__main__':
