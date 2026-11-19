@@ -21,6 +21,7 @@ import aiosqlite
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     filters,
@@ -34,6 +35,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 UZ_TZ = ZoneInfo('Asia/Tashkent')
 
 
+# Faqat haqiqiy butun son: "-100123" ha, "--5" yoki "12a" yo'q
+_INT_RE = re.compile(r'-?\d+')
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     """ENV dan bool o'qish: 1/true/yes/on/ha -> True."""
     raw = os.getenv(name)
@@ -43,12 +48,19 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _env_ids(name: str) -> set:
-    """ENV dan vergul/bo'shliq bilan ajratilgan ID ro'yxatini o'qish."""
+    """ENV dan vergul/bo'shliq bilan ajratilgan ID ro'yxatini o'qish.
+
+    Faqat to'g'ri butun son qabul qilinadi. Ilgari "--5" kabi qiymat
+    `lstrip('-').isdigit()` tekshiruvidan o'tib, int() da bot ishga tushmay qolardi.
+    """
     out = set()
     for part in re.split(r'[,\s;]+', os.getenv(name, "") or ""):
         part = part.strip()
-        if part.lstrip('-').isdigit():
+        if _INT_RE.fullmatch(part):
             out.add(int(part))
+        elif part:
+            logging.getLogger(__name__).warning(
+                "%s ichidagi noto'g'ri qiymat e'tiborsiz qoldirildi: %r", name, part)
     return out
 
 
@@ -77,6 +89,8 @@ class Config:
     ALLOWED_CHANNEL_USERNAMES: frozenset = field(init=False)
 
     MAX_WARNS: int = 3
+    # Ogohlantirish shu kundan keyin o'z-o'zidan kuyib ketadi (har guruh uchun alohida)
+    WARN_TTL_DAYS: int = 30
     MUTE_DURATION_MINUTES: int = 10
     FLOOD_LIMIT: int = 3
     FLOOD_WINDOW_SECONDS: int = 5
@@ -87,6 +101,8 @@ class Config:
     DB_TIMEOUT: int = 10
 
     PM_FLOOD_LIMIT: int = 5
+    # Bitta odamdan kuniga shuncha xabar adminga yo'naltiriladi, keyin to'xtaydi
+    PM_DAILY_LIMIT: int = 30
     PM_FLOOD_WINDOW_SECONDS: int = 10
     ADMIN_REFRESH_DELAY: float = 0.4
     BACKUP_KEEP: int = 7
@@ -116,7 +132,7 @@ class Config:
             part = part.strip()
             if not part:
                 continue
-            if part.lstrip('-').isdigit():
+            if _INT_RE.fullmatch(part):
                 chan_ids.add(int(part))
             else:
                 chan_names.add(part.lstrip('@').lower())
@@ -130,9 +146,11 @@ class Config:
             r'(?:telegram\.me|telegram\.dog)/[a-zA-Z0-9_+]+',
             # DIQQAT: @mention bu yerda YO'Q. Oddiy "@ali" tagi reklama emas —
             # u contains_link() ichida reklama konteksti bilan birga tekshiriladi.
-            # domen: oldida harf/raqam yo'q (versiya "2.5" yoki "file.com" so'z ichida tutilmaydi),
-            # keyin ham qo'shimcha harf bo'lmasligi
-            r'(?<![a-zA-Z0-9.@-])[a-zA-Z][a-zA-Z0-9-]{1,}\.(com|net|org|uz|ru|me|io|co|info|online|site|kg|tj)\b',
+            # domen: SUBDOMENLAR BILAN. Ilgari "(?<!...)" nuqtadan keyingi qismni
+            # tutmasdi va shop.spam.com, my.casino.com kabi havolalar o'tib ketardi.
+            # Oxirgi bo'g'inda kamida bitta HARF bo'lishi shart — shunda "versiya 1.0.net"
+            # yoki IP-ga o'xshash raqamlar domen deb hisoblanmaydi.
+            r'(?<![a-zA-Z0-9@.-])(?:[a-zA-Z0-9][a-zA-Z0-9-]*\.)*[a-zA-Z0-9-]*[a-zA-Z][a-zA-Z0-9-]*\.(com|net|org|uz|ru|me|io|co|info|online|site|kg|tj|xyz|top|shop|store|link|club)\b',
             r'bit\.ly/[a-zA-Z0-9]+',
             r'tinyurl\.com/[a-zA-Z0-9]+',
         ]
@@ -206,6 +224,9 @@ def error_handler(func):
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
+        except ApplicationHandlerStop:
+            # Bu xato emas — "boshqa handlerlar ishlamasin" degan signal
+            raise
         except TelegramError as e:
             logger.error(f"Telegram error in {func.__name__}: {e}")
             raise
@@ -230,7 +251,9 @@ class FloodControl:
 
     async def check(self, user_id: int, is_bot: bool = False, is_admin: bool = False,
                     chat_id: Optional[int] = None) -> bool:
-        if is_admin or is_bot:
+        # Faqat ADMIN ozod. Ilgari `is_bot` ham ozod edi va mantiq qarama-qarshi chiqardi:
+        # begona bot flood qilsa hech narsa bo'lmasdi, lekin link yuborsa ban bo'lardi.
+        if is_admin:
             return False
 
         # Hisoblagich HAR GURUH uchun alohida: odam 3 xil guruhda bittadan yozsa
@@ -391,7 +414,9 @@ async def is_definitely_admin(context: ContextTypes.DEFAULT_TYPE,
                     if chat_id not in admin_manager._admins:
                         admin_manager._admins[chat_id] = set()
                     admin_manager._admins[chat_id].add(user_id)
-                    admin_manager._last_refresh[chat_id] = asyncio.get_event_loop().time()
+                    # DIQQAT: _last_refresh YANGILANMAYDI. Ilgari yangilanardi va
+                    # kesh "to'liq va yangi" deb hisoblanib, haqiqiy to'liq yangilanish
+                    # 10 daqiqa kechikardi (ro'yxatda esa faqat bitta odam bo'lardi).
             except Exception as cache_write_error:
                 logger.warning(f"Admin keshiga yozib bo'lmadi: {cache_write_error}")
 
@@ -570,6 +595,20 @@ class Database:
                         )
                     ''')
 
+                    # Ogohlantirishlar HAR GURUH uchun alohida saqlanadi.
+                    # Ilgari users.warn_count umumiy edi: 3 xil guruhda bittadan
+                    # ogohlantirish olgan odam ban bo'lardi.
+                    await conn.execute('''
+                        CREATE TABLE IF NOT EXISTS chat_warnings (
+                            chat_id INTEGER NOT NULL,
+                            user_id INTEGER NOT NULL,
+                            count INTEGER NOT NULL DEFAULT 0,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (chat_id, user_id)
+                        )
+                    ''')
+                    await conn.execute('CREATE INDEX IF NOT EXISTS idx_warn_updated ON chat_warnings(updated_at)')
+
                     stats_keys = ['total_messages', 'blocked_links', 'banned_users', 'muted_users', 'total_warnings', 'broadcasts_sent']
                     for key in stats_keys:
                         await conn.execute('INSERT OR IGNORE INTO stats (key, value) VALUES (?, 0)', (key,))
@@ -579,19 +618,29 @@ class Database:
                 logger.exception(f"Database initialization failed: {e}")
                 raise
 
-    async def update_user(self, user_id: int, username: str, first_name: str) -> None:
+    async def update_user(self, user_id: int, username: str, first_name: str,
+                          count_message: bool = True, bump_total: bool = False) -> None:
+        """Foydalanuvchini bazaga yozadi.
+
+        count_message=False — faqat ism/username yangilanadi (guruhga kirish kabi
+        hodisalarda xabar soni bekorga ko'paymasligi uchun).
+        bump_total=True — faqat GURUH xabarlari umumiy hisobga qo'shiladi
+        (ilgari shaxsiy xabarlar va guruhga kirishlar ham sanalardi).
+        """
         try:
+            inc = 1 if count_message else 0
             async with self.get_connection() as conn:
                 await conn.execute('''
                     INSERT INTO users (user_id, username, first_name, message_count, warn_count)
-                    VALUES (?, ?, ?, 1, 0)
+                    VALUES (?, ?, ?, ?, 0)
                     ON CONFLICT(user_id) DO UPDATE SET
                         username = excluded.username,
                         first_name = excluded.first_name,
-                        message_count = message_count + 1,
+                        message_count = users.message_count + ?,
                         updated_at = CURRENT_TIMESTAMP
-                ''', (user_id, username, first_name))
-                await conn.execute('UPDATE stats SET value = value + 1, updated_at = CURRENT_TIMESTAMP WHERE key = ?', ('total_messages',))
+                ''', (user_id, username, first_name, inc, inc))
+                if bump_total:
+                    await conn.execute('UPDATE stats SET value = value + 1, updated_at = CURRENT_TIMESTAMP WHERE key = ?', ('total_messages',))
                 await conn.commit()
         except Exception as e:
             logger.error(f"Error updating user {user_id}: {e}")
@@ -684,12 +733,31 @@ class Database:
         except Exception as e:
             logger.error(f"Error marking user {user_id} started: {e}")
 
-    async def add_warning(self, user_id: int, username: str, first_name: str) -> int:
+    async def add_warning(self, chat_id: int, user_id: int, username: str, first_name: str) -> int:
+        """Shu GURUHDAGI ogohlantirishlar sonini bittaga oshiradi va yangisini qaytaradi.
+
+        Oxirgi ogohlantirish WARN_TTL_DAYS kundan eski bo'lsa — hisob 1 dan boshlanadi
+        (eski gunoh abadiy yopishib qolmaydi). Xato bo'lsa 0 qaytaradi; chaqiruvchi
+        0 da JAZO QO'LLAMAYDI.
+        """
         try:
             async with self.get_connection() as conn:
-                # Atomik increment: SELECT+UPDATE race condition oldini olinadi.
-                # RETURNING bilan yangi qiymatni bir so'rovda olamiz (SQLite 3.35+)
                 cursor = await conn.execute('''
+                    INSERT INTO chat_warnings (chat_id, user_id, count)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                        count = CASE
+                            WHEN chat_warnings.updated_at < datetime('now', ?) THEN 1
+                            ELSE chat_warnings.count + 1
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    RETURNING count
+                ''', (chat_id, user_id, f'-{config.WARN_TTL_DAYS} days'))
+                row = await cursor.fetchone()
+                warn_count = row['count'] if row else 0
+
+                # users.warn_count — umrbod umumiy hisob (faqat ko'rsatish uchun)
+                await conn.execute('''
                     INSERT INTO users (user_id, username, first_name, message_count, warn_count)
                     VALUES (?, ?, ?, 0, 1)
                     ON CONFLICT(user_id) DO UPDATE SET
@@ -697,16 +765,39 @@ class Database:
                         username = excluded.username,
                         first_name = excluded.first_name,
                         updated_at = CURRENT_TIMESTAMP
-                    RETURNING warn_count
                 ''', (user_id, username, first_name))
-                row = await cursor.fetchone()
-                warn_count = row['warn_count'] if row else 1
-
                 await conn.execute('UPDATE stats SET value = value + 1, updated_at = CURRENT_TIMESTAMP WHERE key = ?', ('total_warnings',))
                 await conn.commit()
                 return warn_count
         except Exception as e:
-            logger.error(f"Error adding warning for user {user_id}: {e}")
+            logger.error(f"Error adding warning for user {user_id} in chat {chat_id}: {e}")
+            return 0
+
+    async def get_warnings(self, chat_id: int, user_id: int) -> int:
+        """Shu guruhdagi joriy ogohlantirishlar soni (muddati o'tganlari 0)."""
+        try:
+            async with self.get_connection() as conn:
+                row = await (await conn.execute(
+                    "SELECT count FROM chat_warnings WHERE chat_id = ? AND user_id = ? "
+                    "AND updated_at >= datetime('now', ?)",
+                    (chat_id, user_id, f'-{config.WARN_TTL_DAYS} days'))).fetchone()
+                return row['count'] if row else 0
+        except Exception as e:
+            logger.error(f"get_warnings xatosi: {e}")
+            return 0
+
+    async def cleanup_old_warnings(self) -> int:
+        """Muddati o'tgan ogohlantirish yozuvlarini o'chiradi."""
+        try:
+            async with self.get_connection() as conn:
+                cursor = await conn.execute(
+                    "DELETE FROM chat_warnings WHERE updated_at < datetime('now', ?)",
+                    (f'-{config.WARN_TTL_DAYS} days',))
+                deleted = cursor.rowcount
+                await conn.commit()
+                return deleted
+        except Exception as e:
+            logger.error(f"cleanup_old_warnings xatosi: {e}")
             return 0
 
     async def ban_user(self, user_id: int) -> None:
@@ -725,9 +816,15 @@ class Database:
         except Exception as e:
             logger.error(f"unban_user({user_id}) xatosi: {e}")
 
-    async def reset_warnings(self, user_id: int) -> None:
+    async def reset_warnings(self, user_id: int, chat_id: Optional[int] = None) -> None:
+        """Ogohlantirishlarni tozalaydi. chat_id berilsa faqat o'sha guruhda."""
         try:
             async with self.get_connection() as conn:
+                if chat_id is None:
+                    await conn.execute('DELETE FROM chat_warnings WHERE user_id = ?', (user_id,))
+                else:
+                    await conn.execute('DELETE FROM chat_warnings WHERE chat_id = ? AND user_id = ?',
+                                       (chat_id, user_id))
                 await conn.execute('UPDATE users SET warn_count = 0, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
                 await conn.commit()
         except Exception as e:
@@ -739,6 +836,11 @@ class Database:
                 cursor = await conn.execute('SELECT COUNT(*) as count FROM users')
                 users_count = (await cursor.fetchone())['count']
 
+                # Obunachi = botni shaxsiy chatda ochgan (broadcast yetib boradigan).
+                # Ilgari panelda faqat "jami" ko'rsatilardi va u chalg'ituvchi edi.
+                cursor = await conn.execute('SELECT COUNT(*) as count FROM users WHERE started_bot = 1')
+                subs_count = (await cursor.fetchone())['count']
+
                 cursor = await conn.execute('SELECT COUNT(*) as count FROM groups WHERE is_active = 1')
                 groups_count = (await cursor.fetchone())['count']
 
@@ -746,10 +848,11 @@ class Database:
                 stats_rows = await cursor.fetchall()
                 stats = {row['key']: row['value'] for row in stats_rows}
 
-                return {'users': users_count, 'groups': groups_count, **stats}
+                return {'users': users_count, 'subscribers': subs_count,
+                        'groups': groups_count, **stats}
         except Exception as e:
             logger.error(f"get_stats xatosi: {e}")
-            return {'users': 0, 'groups': 0, 'blocked_links': 0, 'banned_users': 0, 'total_messages': 0, 'muted_users': 0, 'total_warnings': 0, 'broadcasts_sent': 0}
+            return {'users': 0, 'subscribers': 0, 'groups': 0, 'blocked_links': 0, 'banned_users': 0, 'total_messages': 0, 'muted_users': 0, 'total_warnings': 0, 'broadcasts_sent': 0}
 
     async def log_activity(self, user_id, username, first_name, chat_id, chat_title, message_text, message_type, action_taken):
         try:
@@ -820,12 +923,28 @@ class Database:
 
 db = Database(config.DB_FILE)
 def get_user_mention(user) -> str:
-    """Markdown-xavfsiz mention. Username bo'lsa @username, aks holda bosiladigan havola."""
-    if user.username:
-        return f"@{escape_markdown(user.username)}"
-    first_name = user.first_name or "Foydalanuvchi"
-    # username yo'q bo'lsa — bosiladigan inline mention havolasi
-    return f"[{escape_markdown(first_name)}](tg://user?id={user.id})"
+    """Markdown-xavfsiz mention. Username bo'lsa @username, aks holda bosiladigan havola.
+
+    DIQQAT: ism safe_md() bilan tozalanadi — aks holda "Ali](http://evil.com)" kabi ism
+    botning o'z ogohlantirishini spam havolaga aylantirib yuboradi.
+    """
+    if user is None:
+        return "Foydalanuvchi"
+    if getattr(user, 'username', None):
+        return f"@{safe_md(user.username)}"
+    first_name = getattr(user, 'first_name', None) or "Foydalanuvchi"
+    return f"[{safe_md(first_name)}](tg://user?id={user.id})"
+
+
+# Markdown v1 "]" , "(" , ")" belgilarini QALQONLAY OLMAYDI.
+# Shu sababli ismi "Ali](http://evil.com)" bo'lgan odam botning o'z xabari ichiga
+# bosiladigan havola joylashi mumkin edi. Ularni butunlay olib tashlaymiz.
+_MD_STRIP = str.maketrans({']': '', '(': '', ')': ''})
+
+
+def safe_md(text) -> str:
+    """Foydalanuvchi/guruh nomini Markdown ichiga qo'yishdan oldin tozalaydi."""
+    return escape_markdown(str(text if text is not None else '').translate(_MD_STRIP))
 
 
 def get_uz_time() -> datetime:
@@ -885,6 +1004,75 @@ def contains_link(text: str) -> bool:
     return _is_promo_mention(text)
 
 
+def _hidden_link_entity(message) -> Optional[str]:
+    """Matn ostiga YASHIRILGAN havolani topadi (text_link).
+
+    Telegram'da "Bu yerni bosing" so'zining ostiga havola yashirish mumkin —
+    matnning o'zida hech qanday link ko'rinmaydi. Ilgari bot entity'larni
+    umuman o'qimasdi va bunday reklama bemalol o'tib ketardi.
+    """
+    for ents in (getattr(message, 'entities', None), getattr(message, 'caption_entities', None)):
+        for ent in (ents or ()):
+            if getattr(ent, 'type', None) == 'text_link' and getattr(ent, 'url', None):
+                return ent.url
+    return None
+
+
+def message_has_link(message) -> Tuple[bool, str]:
+    """Xabarda reklama/havola bormi. (bor_yoq, sabab) qaytaradi."""
+    text = (getattr(message, 'text', None) or getattr(message, 'caption', None) or "")
+    if contains_link(text):
+        return True, 'matn'
+    hidden = _hidden_link_entity(message)
+    if hidden:
+        return True, f'yashirin_havola:{hidden[:80]}'
+    return False, ''
+
+
+_PLAIN = str.maketrans({'*': '', '_': '', '`': '', '[': '', ']': '', '\\': ''})
+
+
+def plain_text(text: str) -> str:
+    """Markdown belgilarini olib tashlaydi (zaxira variant uchun)."""
+    return text.translate(_PLAIN)
+
+
+async def safe_reply(message, text: str):
+    """Markdown bilan javob beradi; parse xatosida oddiy matnda qayta uriniladi.
+
+    MUHIM: ilgari bitta buzuq belgi (masalan ism ichidagi "]") butun bloka xato
+    berib, undan keyingi JAZO (ban/mute) bajarilmay qolardi.
+    """
+    try:
+        return await message.reply_text(text, parse_mode='Markdown')
+    except BadRequest as e:
+        logger.warning(f"Markdown buzildi, oddiy matnda yuborilmoqda: {e}")
+        try:
+            return await message.reply_text(plain_text(text))
+        except TelegramError as e2:
+            logger.error(f"Javob yuborilmadi: {e2}")
+            return None
+    except TelegramError as e:
+        logger.error(f"Javob yuborilmadi: {e}")
+        return None
+
+
+async def safe_send(bot, chat_id: int, text: str):
+    """safe_reply ning send_message varianti."""
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
+    except BadRequest as e:
+        logger.warning(f"Markdown buzildi, oddiy matnda yuborilmoqda: {e}")
+        try:
+            return await bot.send_message(chat_id=chat_id, text=plain_text(text))
+        except TelegramError as e2:
+            logger.error(f"Xabar yuborilmadi: {e2}")
+            return None
+    except TelegramError as e:
+        logger.error(f"Xabar yuborilmadi: {e}")
+        return None
+
+
 def _schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int) -> None:
     """Xabarni delay sekunddan keyin o'chirish. job_queue yo'q bo'lsa ham qulamaydi."""
     job_queue = getattr(context, 'job_queue', None)
@@ -901,8 +1089,8 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
-# Guruh ma'lumotini yangilash throttle keshi: {chat_id: last_member_count_fetch_ts}
-_group_refresh: Dict[int, float] = {}
+# Guruh ma'lumotini yangilash keshi: {chat_id: (last_fetch_ts, oxirgi_yozilgan_nom)}
+_group_refresh: Dict[int, Tuple[float, Optional[str]]] = {}
 _GROUP_REFRESH_INTERVAL = 3600  # 1 soat
 
 # Adminga "yangi xabar" bildirishnomasi throttle keshi: {user_id: last_notify_ts}
@@ -912,6 +1100,11 @@ _PM_NOTIFY_INTERVAL = 300  # har userdan info-header eng ko'pi 5 daqiqada bir ma
 # Shaxsiy chatda flood ogohlantirishi throttle keshi: {user_id: last_warn_ts}
 _pm_flood_warn_ts: Dict[int, float] = {}
 _PM_FLOOD_WARN_INTERVAL = 60
+
+# Kunlik chek: {user_id: (sana, soni}. Burst limiti 10 sekundda 5 ta edi —
+# ya'ni bitta odam kuniga 40 mingdan ortiq xabarni adminning chatiga
+# yo'naltirishi mumkin edi. Endi kunlik chek ham bor.
+_pm_daily: Dict[int, Tuple[str, int]] = {}
 
 # Kesh yoshi: eski yozuvlar tozalanadi (xotira oqishini oldini olish)
 _PM_CACHE_TTL = 86400
@@ -934,6 +1127,13 @@ def _prune_pm_caches() -> None:
             if now - ts > _PM_CACHE_TTL:
                 del cache[uid]
                 removed += 1
+
+    # Kunlik hisob: bugungi bo'lmagan yozuvlar keraksiz
+    today = get_uz_time().strftime('%Y-%m-%d')
+    for uid, (day, _cnt) in list(_pm_daily.items()):
+        if day != today:
+            del _pm_daily[uid]
+            removed += 1
     if removed:
         logger.debug(f"PM keshidan {removed} ta eski yozuv tozalandi")
 
@@ -1000,141 +1200,172 @@ async def _check_sender_chat(context: ContextTypes.DEFAULT_TYPE, message) -> Opt
     return (False, "begona_kanal")
 
 
-async def _handle_foreign_channel_message(context: ContextTypes.DEFAULT_TYPE, message) -> None:
-    """Begona kanal nomidan yozilgan xabar.
+async def _handle_foreign_channel_message(context: ContextTypes.DEFAULT_TYPE, message) -> bool:
+    """Begona kanal nomidan yozilgan xabar. O'chirilgan bo'lsa True qaytaradi.
 
-    Kanalga ogohlantirish berib yoki uni ban qilib bo'lmaydi (u odam emas),
-    shuning uchun faqat reklama bo'lsa xabar o'chiriladi.
+    Kanalga odam kabi ogohlantirish berib bo'lmaydi, lekin Telegram
+    ban_chat_sender_chat ni beradi — shuning uchun takroriy reklamadan keyin
+    kanalning o'zi guruhdan bloklanadi. Ilgari xabar faqat o'chirilardi va
+    kanali bor spammer cheksiz yozaverardi.
     """
     chat = message.chat
     sender_chat = message.sender_chat
     text = message.text or message.caption or ""
 
-    if not contains_link(text):
-        return
+    has_link, link_reason = message_has_link(message)
+    if not has_link:
+        return False
 
     logger.warning(
         f"🚫 KANAL REKLAMASI: sender_chat={sender_chat.id} "
-        f"(@{sender_chat.username or '—'}) chat={chat.id}"
+        f"(@{sender_chat.username or '—'}) chat={chat.id} sabab={link_reason}"
     )
 
     try:
         await message.delete()
     except TelegramError as e:
         logger.warning(f"Kanal xabarini o'chirib bo'lmadi: {e}")
-        return
+        return False
 
     await db.increment_stat('blocked_links')
+    warn_count = await db.add_warning(chat.id, sender_chat.id,
+                                      sender_chat.username, sender_chat.title)
     await db.log_activity(sender_chat.id, sender_chat.username, sender_chat.title,
-                          chat.id, chat.title or "Unknown", text, "spam_link", "blocked_channel")
+                          chat.id, chat.title or "Unknown", text, "spam_link",
+                          f"blocked_channel_warn_{warn_count}")
 
-    try:
-        name = escape_markdown(sender_chat.title or sender_chat.username or "Kanal")
-        # message o'chirilgani uchun reply emas, oddiy xabar yuboramiz
-        warning_msg = await context.bot.send_message(
-            chat_id=chat.id,
-            text=f"🚫 **{name}** kanali nomidan yuborilgan reklama o'chirildi.",
-            parse_mode='Markdown'
-        )
-        _schedule_delete(context, warning_msg.chat_id, warning_msg.message_id, config.WARNING_DELETE_DELAY)
-    except TelegramError as e:
-        logger.error(f"Kanal ogohlantirishini yuborib bo'lmadi: {e}")
+    extra = ""
+    if 0 < warn_count and warn_count >= config.MAX_WARNS:
+        try:
+            await context.bot.ban_chat_sender_chat(chat.id, sender_chat.id)
+            extra = "\n\n⛔️ Takroriy reklama uchun kanal guruhdan bloklandi."
+            logger.info(f"⛔️ Kanal {sender_chat.id} guruh {chat.id} dan bloklandi")
+        except TelegramError as e:
+            logger.error(f"Kanalni bloklab bo'lmadi: {e}")
+
+    name = safe_md(sender_chat.title or sender_chat.username or "Kanal")
+    warning_msg = await safe_send(
+        context.bot, chat.id,
+        f"🚫 **{name}** kanali nomidan yuborilgan reklama o'chirildi.{extra}")
+    if warning_msg is not None:
+        _schedule_delete(context, warning_msg.chat_id, warning_msg.message_id,
+                         config.WARNING_DELETE_DELAY)
+    return True
 
 
 async def _maybe_update_group(context: ContextTypes.DEFAULT_TYPE, chat) -> None:
-    """Guruhni DB ga yozadi. member_count uchun API ni faqat soatiga bir marta chaqiradi."""
+    """Guruhni DB ga yozadi — lekin HAR XABARDA emas.
+
+    Ilgari member_count uchun API chaqiruvi throttle qilingan, bazaga yozish esa
+    har bir xabarda bajarilardi (sekundiga yuzlab keraksiz yozuv). Endi yozuv
+    faqat nom o'zgarganda yoki throttle muddati tugaganda bajariladi.
+    """
     now = asyncio.get_event_loop().time()
-    last = _group_refresh.get(chat.id, 0)
+    last, known_title = _group_refresh.get(chat.id, (0.0, None))
+    title = chat.title or "Unknown"
 
     if now - last > _GROUP_REFRESH_INTERVAL:
-        _group_refresh[chat.id] = now
         try:
             member_count = await context.bot.get_chat_member_count(chat.id)
-            await db.update_group(chat.id, chat.title or "Unknown", member_count)
+            await db.update_group(chat.id, title, member_count)
+            _group_refresh[chat.id] = (now, title)
             return
         except TelegramError as e:
             # Xato bo'lsa bir soat kutmaymiz — 5 daqiqadan keyin qayta urinamiz
-            _group_refresh[chat.id] = now - _GROUP_REFRESH_INTERVAL + 300
+            _group_refresh[chat.id] = (now - _GROUP_REFRESH_INTERVAL + 300, known_title)
             logger.debug(f"get_chat_member_count({chat.id}) xatosi: {e}")
 
-    # Tez-tez: API siz, faqat title yangilanadi (mavjud member_count saqlanadi)
-    await db.update_group(chat.id, chat.title or "Unknown")
+    if known_title != title:
+        # Nom o'zgardi — faqat shu holatda yozamiz (API chaqiruvisiz)
+        await db.update_group(chat.id, title)
+        _group_refresh[chat.id] = (_group_refresh.get(chat.id, (now, None))[0], title)
+
+
+# Guruhda /start ga javob berish throttle'i: {chat_id: last_reply_ts}
+_group_start_reply: Dict[int, float] = {}
+_GROUP_START_REPLY_INTERVAL = 300
 
 
 @error_handler
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    message = update.message
+    if not message or not message.from_user:
         return
 
-    message = update.message
     user = message.from_user
 
-    if message.chat.type == 'private':
+    if message.chat.type != 'private':
+        # GURUHDA: javob 5 daqiqada eng ko'pi bir marta va o'zi o'chadi.
+        # Ilgari har /start ga javob yozilardi — istalgan odam bot bilan
+        # guruhni spamlay olardi (komandalar flood hisobiga ham tushmaydi).
+        now = asyncio.get_event_loop().time()
+        if now - _group_start_reply.get(message.chat.id, 0) < _GROUP_START_REPLY_INTERVAL:
+            return
+        _group_start_reply[message.chat.id] = now
+        reply = await safe_reply(
+            message, "✅ Bot faol ishlayapti!\n🛡 Guruh spam va reklamadan himoyalangan.")
+        if reply is not None:
+            _schedule_delete(context, reply.chat_id, reply.message_id, 15)
+        return
+
+    is_new_user = False
+    try:
+        async with db.get_connection() as conn:
+            existing_user = await (await conn.execute('SELECT user_id FROM users WHERE user_id = ?', (user.id,))).fetchone()
+            is_new_user = existing_user is None
+    except Exception as e:
+        logger.error(f"Error checking if user is new: {e}")
         is_new_user = False
-        try:
-            async with db.get_connection() as conn:
-                existing_user = await (await conn.execute('SELECT user_id FROM users WHERE user_id = ?', (user.id,))).fetchone()
-                is_new_user = existing_user is None
-        except Exception as e:
-            logger.error(f"Error checking if user is new: {e}")
-            is_new_user = False
 
-        await db.update_user(user.id, user.username, user.first_name)
-        # Shaxsiy chatda /start bosgan — broadcast yetib boradigan user deb belgilaymiz
-        await db.mark_user_started(user.id, user.username, user.first_name)
+    await db.update_user(user.id, user.username, user.first_name, count_message=False)
+    # Shaxsiy chatda /start bosgan — broadcast yetib boradigan user deb belgilaymiz
+    await db.mark_user_started(user.id, user.username, user.first_name)
 
-        if is_new_user:
-            celebration_text = (
-                f"🎉 **TABRIKLAYMIZ, {escape_markdown(user.first_name)}!**\n\n"
-                f"🎊 Siz botimizning yangi foydalanuvchisisiz!\n\n"
-                f"✨ Botdan foydalanganingiz uchun tashakkur!\n"
-                f"🛡 Endi guruhlaringizni himoya qilishingiz mumkin."
-            )
-
-            try:
-                await message.reply_text(celebration_text, parse_mode='Markdown')
-                await asyncio.sleep(3)
-            except Exception as e:
-                logger.error(f"Failed to send celebration message: {e}")
-
-            try:
-                username_display = f"@{escape_markdown(user.username)}" if user.username else escape_markdown(user.first_name)
-                admin_notification = (
-                    f"🎉 **YANGI FOYDALANUVCHI!**\n\n"
-                    f"👤 Ism: {escape_markdown(user.first_name)}\n"
-                    f"🆔 Username: {username_display}\n"
-                    f"🔢 ID: `{user.id}`\n"
-                    f"⏰ {format_uz_time()}\n\n"
-                    f"🎊 Bot foydalanuvchilari yana 1 taga ko'paydi!"
-                )
-
-                await context.bot.send_message(chat_id=config.ADMIN_ID, text=admin_notification, parse_mode='Markdown')
-                logger.info(f"✅ New user notification: {user.id}")
-            except Exception as e:
-                logger.error(f"Failed to send notification: {e}")
-
-        welcome_text = (
-            f"👋 Assalomu alaykum, **{escape_markdown(user.first_name)}**!\n\n"
-            "🛡 Men guruhlarni spam va reklamadan himoya qiluvchi botman.\n\n"
-            "**Imkoniyatlar:**\n"
-            "• 🔗 Link va reklama bloklash\n"
-            "• ⚠️ Avtomatik ogohlantirish\n"
-            "• 🔇 Spam nazorati"
+    if is_new_user:
+        celebration_text = (
+            f"🎉 **TABRIKLAYMIZ, {safe_md(user.first_name)}!**\n\n"
+            f"🎊 Siz botimizning yangi foydalanuvchisisiz!\n\n"
+            f"✨ Botdan foydalanganingiz uchun tashakkur!\n"
+            f"🛡 Endi guruhlaringizni himoya qilishingiz mumkin."
         )
+        # DIQQAT: bu yerda asyncio.sleep() YO'Q — u butun botni to'xtatib turardi.
+        await safe_reply(message, celebration_text)
 
-        keyboard = [
-            [InlineKeyboardButton("➕ Guruhga qo'shish", url=f"https://t.me/{config.BOT_USERNAME}?startgroup=true")],
-            [InlineKeyboardButton("ℹ️ Yordam", callback_data="help")]
-        ]
+        username_display = f"@{safe_md(user.username)}" if user.username else safe_md(user.first_name)
+        admin_notification = (
+            f"🎉 **YANGI FOYDALANUVCHI!**\n\n"
+            f"👤 Ism: {safe_md(user.first_name)}\n"
+            f"🆔 Username: {username_display}\n"
+            f"🔢 ID: `{user.id}`\n"
+            f"⏰ {format_uz_time()}\n\n"
+            f"🎊 Bot foydalanuvchilari yana 1 taga ko'paydi!"
+        )
+        if await safe_send(context.bot, config.ADMIN_ID, admin_notification) is not None:
+            logger.info(f"✅ New user notification: {user.id}")
 
-        if is_bot_admin(user.id):
-            keyboard.append([InlineKeyboardButton("📊 Admin Panel", callback_data="admin")])
+    welcome_text = (
+        f"👋 Assalomu alaykum, **{safe_md(user.first_name)}**!\n\n"
+        "🛡 Men guruhlarni spam va reklamadan himoya qiluvchi botman.\n\n"
+        "**Imkoniyatlar:**\n"
+        "• 🔗 Link va reklama bloklash\n"
+        "• ⚠️ Avtomatik ogohlantirish\n"
+        "• 🔇 Spam nazorati"
+    )
 
+    keyboard = [
+        [InlineKeyboardButton("➕ Guruhga qo'shish", url=f"https://t.me/{config.BOT_USERNAME}?startgroup=true")],
+        [InlineKeyboardButton("ℹ️ Yordam", callback_data="help")]
+    ]
+    if is_bot_admin(user.id):
+        keyboard.append([InlineKeyboardButton("📊 Admin Panel", callback_data="admin")])
+
+    try:
         await message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    else:
-        await message.reply_text("✅ Bot faol ishlayapti!\n🛡 Guruh spam va reklamadan himoyalangan.", parse_mode='Markdown')
+    except BadRequest:
+        await message.reply_text(plain_text(welcome_text), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+@error_handler
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
 
@@ -1188,7 +1419,8 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     stats_text = (
         "📊 **BOT STATISTIKASI**\n\n"
         "👥 **Foydalanuvchilar:**\n"
-        f"   • Jami: **{stats['users']:,}** ta\n"
+        f"   • Bot ko'rgan: **{stats['users']:,}** ta\n"
+        f"   • Obunachi (xabar yetadi): **{stats.get('subscribers', 0):,}** ta\n"
         f"   • Banlangan: **{stats.get('banned_users', 0):,}** ta\n\n"
         "💬 **Guruhlar:**\n"
         f"   • Faol: **{stats['groups']:,}** ta\n\n"
@@ -1220,7 +1452,9 @@ async def groups_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not groups:
         text = "📋 **GURUHLAR RO'YXATI**\n\n❌ Hozircha faol guruhlar yo'q."
     else:
-        groups_text = "\n".join([f"{i}. {title}" for i, (_, title) in enumerate(groups[:25], 1)])
+        # Guruh nomi qalqonlanadi: nomida "_" yoki "[" bo'lgan guruh
+        # ilgari butun panelni ishdan chiqarardi (BadRequest: can't parse entities)
+        groups_text = "\n".join([f"{i}. {safe_md(title)}" for i, (_, title) in enumerate(groups[:25], 1)])
         text = f"📋 **GURUHLAR RO'YXATI**\n\nJami: **{len(groups)}** ta faol guruh\n\n{groups_text}"
         if len(groups) > 25:
             text += f"\n\n... va yana **{len(groups) - 25}** ta guruh"
@@ -1254,7 +1488,7 @@ async def users_count_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             for i, user in enumerate(users, 1):
                 username = user['username'] or user['first_name'] or "Unknown"
-                username_escaped = escape_markdown(username)
+                username_escaped = safe_md(username)
                 msg_count = user['message_count']
                 banned = "🚫" if user['is_banned'] else ""
 
@@ -1371,7 +1605,7 @@ async def back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user = query.from_user
     welcome_text = (
-        f"👋 Assalomu alaykum, **{escape_markdown(user.first_name)}**!\n\n"
+        f"👋 Assalomu alaykum, **{safe_md(user.first_name)}**!\n\n"
         "🛡 Men guruhlarni spam va reklamadan himoya qiluvchi botman.\n\n"
         "**Imkoniyatlar:**\n"
         "• 🔗 Link va reklama bloklash\n"
@@ -1407,34 +1641,38 @@ async def activity_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     activities = await db.get_recent_activity(hours=hours, limit=50)
 
     if not activities:
-        await update.message.reply_text(f"📊 **ACTIVITY LOG**\n\nOxirgi {hours} soatda faoliyat yo'q.", parse_mode='Markdown')
+        await safe_reply(update.message, f"📊 **ACTIVITY LOG**\n\nOxirgi {hours} soatda faoliyat yo'q.")
         return
 
     text = f"📊 **ACTIVITY LOG** (Oxirgi {hours} soat)\n\n"
 
     for i, act in enumerate(activities[:20], 1):
-        username = act['username'] or act['first_name'] or "Unknown"
-        action = act['action_taken']
+        # DIQQAT: bu yerdagi matnlar SPAMMERNING O'ZI yozgan matn.
+        # Ilgari qalqonlanmasdi va spammer "[bosing](http://evil.com)" yozsa,
+        # bot o'sha havolani adminning chatida bosiladigan qilib ko'rsatardi
+        # (yoki butun /activity "can't parse entities" bilan ishdan chiqardi).
+        username = safe_md(act['username'] or act['first_name'] or "Unknown")
+        action = safe_md(act['action_taken'])
+        chat_title = safe_md(act['chat_title'])
         raw_text = act['message_text'] or "—"
-        msg_preview = (raw_text[:30] + "...") if len(raw_text) > 30 else raw_text
+        msg_preview = safe_md((raw_text[:30] + "...") if len(raw_text) > 30 else raw_text)
         try:
             ts = act['timestamp']
             dt_utc = ts if isinstance(ts, datetime) else datetime.strptime(str(ts).split('.')[0], '%Y-%m-%d %H:%M:%S')
             if dt_utc.tzinfo is None:
                 dt_utc = dt_utc.replace(tzinfo=ZoneInfo('UTC'))
-            dt_uz = dt_utc.astimezone(UZ_TZ)
-            timestamp = dt_uz.strftime('%d.%m.%Y %H:%M:%S')
+            timestamp = dt_utc.astimezone(UZ_TZ).strftime('%d.%m.%Y %H:%M:%S')
         except Exception:
-            timestamp = str(act['timestamp']).split('.')[0] if '.' in str(act['timestamp']) else str(act['timestamp'])
+            timestamp = safe_md(str(act['timestamp']).split('.')[0])
 
-        text += f"{i}. **{username}** | {act['chat_title']}\n   💬 {msg_preview}\n   ⚡ {action} | {timestamp}\n\n"
+        text += f"{i}. **{username}** | {chat_title}\n   💬 {msg_preview}\n   ⚡ {action} | {timestamp}\n\n"
 
     if len(activities) > 20:
         text += f"... va yana {len(activities) - 20} ta faoliyat\n\n"
 
     text += f"📍 Jami: **{len(activities)}** ta faoliyat\n⏰ Yangilangan: {format_uz_time(format_str='%H:%M:%S')}"
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await safe_reply(update.message, text)
 
 
 @admin_only
@@ -1482,7 +1720,7 @@ async def users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             except Exception:
                 updated = str(user['updated_at']).split(' ')[0] if user['updated_at'] and ' ' in str(user['updated_at']) else (str(user['updated_at']) or "Unknown")
 
-            username_escaped = escape_markdown(username)
+            username_escaped = safe_md(username)
             text += f"{i}. **{username_escaped}** {banned}\n   💬 {msg_count} xabar | ⚠️ {warns} ogohlantirish\n   📅 {updated}\n\n"
 
         if total_users > 30:
@@ -1504,34 +1742,43 @@ async def refresh_admins_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not update.message:
         return
 
-    try:
-        status_msg = await update.message.reply_text("🔄 Admin ro'yxatlari yangilanmoqda...", parse_mode='Markdown')
+    groups = await db.get_active_groups()
+    status_msg = await safe_reply(
+        update.message, f"🔄 Admin ro'yxatlari fonda yangilanmoqda ({len(groups)} guruh)...")
 
-        groups = await db.get_active_groups()
-        success_count = 0
-
+    async def _job():
+        """Fonda ishlaydi: ilgari bu sikl butun botni bloklab turardi
+        (100 guruh x pauza), pauzasiz esa Telegram flood-limitiga tushardi."""
+        success = 0
+        failed = 0
         for chat_id, title in groups:
             try:
-                await admin_manager.refresh_admins(context.bot, chat_id)
-                success_count += 1
+                # MUHIM: refresh_admins() xato bo'lsa False qaytaradi.
+                # Ilgari javob o'qilmasdi va hisobot har doim "50/50" deb yolg'on yozardi.
+                if await admin_manager.refresh_admins(context.bot, chat_id):
+                    success += 1
+                else:
+                    failed += 1
             except Exception as e:
+                failed += 1
                 logger.error(f"Failed to refresh admins for {title}: {e}")
+            await asyncio.sleep(config.ADMIN_REFRESH_DELAY)
 
         stats = admin_manager.get_stats()
-
         result_text = (
-            f"✅ **ADMIN RO'YXATLARI YANGILANDI**\n\n"
-            f"📊 Guruhlar: {success_count}/{len(groups)}\n"
-            f"👥 Jami adminlar: {stats['total_admins']}\n\n"
-            f"ℹ️ Endi barcha adminlar to'g'ri taniladi."
+            f"{'✅' if failed == 0 else '⚠️'} **ADMIN RO'YXATLARI YANGILANDI**\n\n"
+            f"📊 Muvaffaqiyatli: {success}/{len(groups)}\n"
+            f"❌ Xatolik: {failed}\n"
+            f"👥 Keshdagi adminlar: {stats['total_admins']}"
         )
+        if status_msg is not None:
+            try:
+                await status_msg.edit_text(result_text, parse_mode='Markdown')
+            except TelegramError as e:
+                logger.warning(f"Hisobotni tahrirlab bo'lmadi: {e}")
+        logger.info(f"Manual admin refresh completed: {success}/{len(groups)} groups, {failed} xato")
 
-        await status_msg.edit_text(result_text, parse_mode='Markdown')
-        logger.info(f"Manual admin refresh completed: {success_count}/{len(groups)} groups")
-
-    except Exception as e:
-        logger.error(f"Error in refresh_admins_handler: {e}")
-        await update.message.reply_text("❌ Xatolik yuz berdi.", parse_mode='Markdown')
+    context.application.create_task(_job())
 
 
 async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[int], Optional[str]]:
@@ -1542,13 +1789,16 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return u.id, get_user_mention(u)
     if context.args:
         arg = context.args[0].lstrip('@')
-        if arg.isdigit():
+        if _INT_RE.fullmatch(arg):
             return int(arg), f"`{arg}`"
         try:
             async with db.get_connection() as conn:
-                row = await (await conn.execute('SELECT user_id FROM users WHERE username = ?', (arg,))).fetchone()
+                # Telegram username'lari katta-kichik harfni farqlamaydi.
+                # Ilgari "WHERE username = ?" edi va /unban @Ali bazadagi "ali" ni topmasdi.
+                row = await (await conn.execute(
+                    'SELECT user_id FROM users WHERE username = ? COLLATE NOCASE', (arg,))).fetchone()
                 if row:
-                    return row['user_id'], f"@{escape_markdown(arg)}"
+                    return row['user_id'], f"@{safe_md(arg)}"
         except Exception as e:
             logger.error(f"_resolve_target username qidirish xatosi: {e}")
     return None, None
@@ -1561,7 +1811,7 @@ async def _moderation_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return False
     is_admin, _ = await is_definitely_admin(context, message.chat.id, message.from_user.id, message.from_user)
     if not is_admin:
-        await message.reply_text("❌ Bu komanda faqat adminlar uchun.")
+        await safe_reply(message, "❌ Bu komanda faqat adminlar uchun.")
         return False
     return True
 
@@ -1570,63 +1820,96 @@ async def _moderation_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def unwarn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _moderation_guard(update, context):
         return
+    message = update.effective_message
     target_id, mention = await _resolve_target(update, context)
     if not target_id:
-        await update.effective_message.reply_text("ℹ️ Foydalanish: xabarga **reply** qilib `/unwarn` yoki `/unwarn <ID|@username>`", parse_mode='Markdown')
+        await safe_reply(message, "ℹ️ Foydalanish: xabarga **reply** qilib `/unwarn` yoki `/unwarn <ID|@username>`")
         return
-    await db.reset_warnings(target_id)
-    await update.effective_message.reply_text(f"✅ {mention} — ogohlantirishlari tozalandi.", parse_mode='Markdown')
+    # Faqat SHU guruhdagi ogohlantirishlar tozalanadi
+    await db.reset_warnings(target_id, chat_id=message.chat.id)
+    await safe_reply(message, f"✅ {mention} — bu guruhdagi ogohlantirishlari tozalandi.")
 
 
 @error_handler
 async def unban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _moderation_guard(update, context):
         return
+    message = update.effective_message
     target_id, mention = await _resolve_target(update, context)
     if not target_id:
-        await update.effective_message.reply_text("ℹ️ Foydalanish: `/unban <ID|@username>` yoki xabarga reply qiling", parse_mode='Markdown')
+        await safe_reply(message, "ℹ️ Foydalanish: `/unban <ID|@username>` yoki xabarga reply qiling")
         return
-    chat = update.effective_message.chat
+    chat = message.chat
+    # Ilgari xato bo'lsa ham "✅ bani olib tashlandi" deb yozilardi.
     try:
         await context.bot.unban_chat_member(chat.id, target_id, only_if_banned=True)
     except TelegramError as e:
         logger.error(f"unban failed: {e}")
+        await safe_reply(message, f"❌ {mention} — Telegram banni olmadi: `{safe_md(str(e)[:120])}`")
+        return
     await db.unban_user(target_id)
-    await db.reset_warnings(target_id)
-    await update.effective_message.reply_text(f"✅ {mention} — bani olib tashlandi.", parse_mode='Markdown')
+    await db.reset_warnings(target_id, chat_id=chat.id)
+    await safe_reply(message, f"✅ {mention} — bani olib tashlandi.")
 
 
 @error_handler
 async def unmute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _moderation_guard(update, context):
         return
+    message = update.effective_message
     target_id, mention = await _resolve_target(update, context)
     if not target_id:
-        await update.effective_message.reply_text("ℹ️ Foydalanish: xabarga **reply** qilib `/unmute` yoki `/unmute <ID|@username>`", parse_mode='Markdown')
+        await safe_reply(message, "ℹ️ Foydalanish: xabarga **reply** qilib `/unmute` yoki `/unmute <ID|@username>`")
         return
-    chat = update.effective_message.chat
+    chat = message.chat
+
+    # Bot API 6.5 dan keyin huquqlar alohida-alohida bo'ldi: berilmagan huquq
+    # "taqiqlangan" deb olinadi. Ilgari faqat 4 tasi berilardi va odam
+    # matn yozardi, lekin rasm/video/fayl yuborolmasdi — ya'ni yarim mute'da qolardi.
+    permissions = None
     try:
-        await context.bot.restrict_chat_member(
-            chat.id, target_id,
-            ChatPermissions(can_send_messages=True, can_send_polls=True,
-                            can_send_other_messages=True, can_add_web_page_previews=True)
-        )
+        info = await context.bot.get_chat(chat.id)
+        permissions = getattr(info, 'permissions', None)
+    except TelegramError as e:
+        logger.debug(f"get_chat({chat.id}) permissions olinmadi: {e}")
+
+    if permissions is None:
+        permissions = ChatPermissions(
+            can_send_messages=True, can_send_audios=True, can_send_documents=True,
+            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+            can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+            can_add_web_page_previews=True, can_invite_users=True, can_react_to_messages=True)
+
+    try:
+        await context.bot.restrict_chat_member(chat.id, target_id, permissions)
     except TelegramError as e:
         logger.error(f"unmute failed: {e}")
-        await update.effective_message.reply_text("❌ Mute'ni ololmadim (bot huquqlarini tekshiring).")
+        await safe_reply(message, "❌ Mute'ni ololmadim (bot huquqlarini tekshiring).")
         return
-    await db.reset_warnings(target_id)
-    await update.effective_message.reply_text(f"✅ {mention} — mute olib tashlandi.", parse_mode='Markdown')
+    await db.reset_warnings(target_id, chat_id=chat.id)
+    await safe_reply(message, f"✅ {mention} — mute olib tashlandi.")
 
 
 @error_handler
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not is_bot_admin(update.message.from_user.id):
+    if not update.message or not update.message.from_user:
         return
+    if not is_bot_admin(update.message.from_user.id):
+        return
+
+    stopped = False
+    if context.user_data.get('broadcast_running'):
+        # Ketayotgan tarqatishni ham to'xtatamiz. Ilgari faqat rejim tozalanardi
+        # va boshlanib ketgan broadcast'ni hech qanday yo'l bilan to'xtatib bo'lmasdi.
+        context.user_data['broadcast_cancel'] = True
+        stopped = True
 
     if context.user_data.get('broadcast_mode'):
         context.user_data['broadcast_mode'] = None
-        await update.message.reply_text("❌ Amal bekor qilindi.", parse_mode='Markdown')
+        stopped = True
+
+    if stopped:
+        await safe_reply(update.message, "❌ Amal bekor qilindi.")
 
 
 @error_handler
@@ -1651,11 +1934,24 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
         logger.warning(f"🚫 PM FLOOD: user {user.id} xabari adminga yuborilmadi")
         return
 
-    await db.update_user(user.id, user.username, user.first_name)
+    await db.update_user(user.id, user.username, user.first_name, count_message=False)
     # Shaxsiy chatga yozgan — botni ochgan, broadcast yetib boradigan user
     await db.mark_user_started(user.id, user.username, user.first_name)
 
     if not is_bot_admin(user.id):
+        # KUNLIK CHEK: bir odam adminning chatini kun bo'yi to'ldirib tashlamasin
+        today = get_uz_time().strftime('%Y-%m-%d')
+        day, count = _pm_daily.get(user.id, (today, 0))
+        if day != today:
+            count = 0
+        if count >= config.PM_DAILY_LIMIT:
+            _pm_daily[user.id] = (today, count + 1)
+            if count == config.PM_DAILY_LIMIT:
+                await safe_reply(message, "ℹ️ Bugunlik xabar chegarasiga yetdingiz. Ertaga davom etamiz.")
+            logger.warning(f"🚫 PM KUNLIK CHEK: user {user.id} xabari yuborilmadi")
+            return
+        _pm_daily[user.id] = (today, count + 1)
+
         try:
             # Info-header (kim yozayotgani) faqat 5 daqiqada bir marta — admin chati spamlanmaydi.
             # Xabarning o'zi har doim forward qilinadi.
@@ -1685,11 +1981,14 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
 
     context.user_data['broadcast_mode'] = None
     context.user_data['broadcast_running'] = True
-    asyncio.create_task(run_broadcast_task(context.bot, update.message.chat_id, update.message.message_id, broadcast_mode, context.user_data))
+    context.user_data['broadcast_cancel'] = False
+    context.application.create_task(
+        run_broadcast_task(context.bot, update.message.chat_id, update.message.message_id,
+                           broadcast_mode, context.user_data))
 
 async def run_broadcast_task(bot, from_chat_id, message_id, broadcast_mode, user_data):
     try:
-        await _run_broadcast(bot, from_chat_id, message_id, broadcast_mode)
+        await _run_broadcast(bot, from_chat_id, message_id, broadcast_mode, user_data)
     except Exception as e:
         logger.exception(f"Broadcast task failed: {e}")
         try:
@@ -1700,6 +1999,7 @@ async def run_broadcast_task(bot, from_chat_id, message_id, broadcast_mode, user
         # Flag har qanday holatda tozalanadi — keyingi broadcast bloklanib qolmaydi
         if user_data is not None:
             user_data['broadcast_running'] = False
+            user_data['broadcast_cancel'] = False
 
 
 # Manba xabarga tegishli xatolar — HAR BIR manzil uchun qaytadi.
@@ -1747,7 +2047,7 @@ async def _report_broadcast_abort(status_message, reason: str, sent: int = 0, to
         f"📤 To'xtashdan oldin yuborilgan: **{sent}/{total}**\n"
         "✅ **Hech bir guruh/foydalanuvchi ro'yxatdan chiqarilmadi.**\n\n"
         "Xabarni qayta yuborib ko'ring.\n\n"
-        f"`{escape_markdown(reason[:200])}`"
+        f"`{safe_md(reason[:200])}`"
     )
     try:
         await status_message.edit_text(text, parse_mode='Markdown')
@@ -1766,7 +2066,11 @@ async def _broadcast_send(bot, target_id, from_chat_id, message_id) -> None:
         await bot.copy_message(chat_id=target_id, from_chat_id=from_chat_id, message_id=message_id)
 
 
-async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
+def _broadcast_cancelled(user_data) -> bool:
+    return bool(user_data is not None and user_data.get('broadcast_cancel'))
+
+
+async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode, user_data=None):
     groups = []
     users = []
 
@@ -1789,8 +2093,12 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
     failed_list = []
     last_update_time = asyncio.get_event_loop().time()
     abort_reason = None
+    cancelled = False
 
     for index, (chat_id, title) in enumerate(groups, 1):
+        if _broadcast_cancelled(user_data):
+            cancelled = True
+            break
         try:
             await _broadcast_send(bot, chat_id, from_chat_id, message_id)
             success_count += 1
@@ -1798,7 +2106,7 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
         except (Forbidden, BadRequest) as e:
             kind = _classify_broadcast_error(e)
             fail_count += 1
-            failed_list.append(('group', title, str(e)))
+            failed_list.append(('group', title, str(e), kind))
             if kind == 'source':
                 abort_reason = str(e)
                 logger.error(f"🛑 Broadcast to'xtatildi — manba xabarda muammo: {e}")
@@ -1808,7 +2116,7 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
             logger.warning(f"Failed to send to group {title} ({kind}): {e}")
         except TelegramError as e:
             fail_count += 1
-            failed_list.append(('group', title, str(e)))
+            failed_list.append(('group', title, str(e), 'transient'))
             logger.error(f"Telegram error for group {title}: {e}")
 
         now = asyncio.get_event_loop().time()
@@ -1826,6 +2134,9 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
         return
 
     for index, (user_id, username, first_name) in enumerate(users, len(groups) + 1):
+        if _broadcast_cancelled(user_data):
+            cancelled = True
+            break
         try:
             await _broadcast_send(bot, user_id, from_chat_id, message_id)
             success_count += 1
@@ -1835,7 +2146,7 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
         except (Forbidden, BadRequest) as e:
             kind = _classify_broadcast_error(e)
             fail_count += 1
-            failed_list.append(('user', username or first_name or str(user_id), str(e)))
+            failed_list.append(('user', username or first_name or str(user_id), str(e), kind))
             if kind == 'source':
                 abort_reason = str(e)
                 logger.error(f"🛑 Broadcast to'xtatildi — manba xabarda muammo: {e}")
@@ -1848,7 +2159,7 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
             logger.warning(f"Failed to send to user {user_id} ({kind}): {e}")
         except TelegramError as e:
             fail_count += 1
-            failed_list.append(('user', username or first_name or str(user_id), str(e)))
+            failed_list.append(('user', username or first_name or str(user_id), str(e), 'transient'))
             logger.error(f"Telegram error for user {user_id}: {e}")
 
         now = asyncio.get_event_loop().time()
@@ -1867,7 +2178,8 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
 
     await db.increment_stat('broadcasts_sent', success_count)
 
-    result_text = f"✅ **XABAR YUBORILDI**\n\n📊 Jami: **{total}**\n✅ Muvaffaqiyatli: **{success_count}**\n❌ Xatolik: **{fail_count}**\n\n"
+    head = "🛑 **XABAR TARQATISH BEKOR QILINDI**" if cancelled else "✅ **XABAR YUBORILDI**"
+    result_text = f"{head}\n\n📊 Jami: **{total}**\n✅ Muvaffaqiyatli: **{success_count}**\n❌ Xatolik: **{fail_count}**\n\n"
 
     if broadcast_mode == 'all':
         result_text += f"📢 Guruhlar: **{len(groups)}** ta\n👥 Foydalanuvchilar: **{len(users)}** ta\n\n"
@@ -1877,18 +2189,26 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
     if failed_list:
         result_text += f"\n\n❌ **Xatolik bo'lganlar ({len(failed_list)} ta):**\n"
 
-        for type_, name, error in failed_list[:15]:
+        # Sabab xato MATNIDAN emas, tasniflangan TURIDAN olinadi.
+        # Ilgari "'Forbidden' in error" tekshirilardi, lekin str(Forbidden(...)) ichida
+        # "Forbidden" so'zi yo'q — shuning uchun har doim "Xatolik" chiqardi.
+        for type_, name, error, kind in failed_list[:15]:
             emoji = "📢" if type_ == 'group' else "👤"
-            name_escaped = escape_markdown(name[:30])
+            name_escaped = safe_md(name[:30])
+            low = error.lower()
 
-            if 'Forbidden' in error:
+            if 'blocked by the user' in low:
                 reason = "Bot bloklangan"
-            elif 'not found' in error or 'chat not found' in error:
-                reason = "Guruh topilmadi"
-            elif 'deactivated' in error:
-                reason = "User o'chirilgan"
+            elif 'bot was kicked' in low or 'bot is not a member' in low:
+                reason = "Bot guruhdan chiqarilgan"
+            elif 'chat not found' in low or 'user not found' in low:
+                reason = "Topilmadi"
+            elif 'deactivated' in low:
+                reason = "Akkaunt o'chirilgan"
+            elif kind == 'dead':
+                reason = "Yetib bormadi"
             else:
-                reason = "Xatolik"
+                reason = "Vaqtinchalik xato"
 
             result_text += f"{emoji} {name_escaped} - {reason}\n"
 
@@ -1901,20 +2221,21 @@ async def _run_broadcast(bot, from_chat_id, message_id, broadcast_mode):
 
 @error_handler
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """PRODUCTION: Handle all group messages with smart admin detection.
-    effective_message yangi VA tahrirlangan (edited) xabarlarni ham qamrab oladi —
-    spammer toza xabar yuborib keyin link qo'shib tahrirlay olmaydi."""
+    """Guruh xabarlarini tekshiradi (yangi VA tahrirlangan, KOMANDALAR ham).
+
+    Bu handler -1 guruhda ro'yxatdan o'tadi — ya'ni boshqa handlerlardan OLDIN
+    ishlaydi. Shuning uchun "/reklama http://spam.com" kabi xabar ham tekshiriladi.
+    Xabar o'chirilsa ApplicationHandlerStop ko'tariladi va qolgan handlerlar
+    (masalan /start javobi) o'chirilgan xabarga javob bermaydi.
+    """
     message = update.effective_message
     if not message or not message.from_user:
         return
 
     user = message.from_user
     chat = message.chat
-
     message_text = message.text or message.caption or "[media]"
 
-    # Guruh ma'lumotini har xabarda emas, faqat keshda muddati o'tganda yangilaymiz
-    # (har xabarda get_chat/get_chat_member_count chaqirish Telegram rate-limitini buzadi)
     await _maybe_update_group(context, chat)
 
     # KANAL/GURUH NOMIDAN yuborilgan xabarlar: oddiy admin tekshiruvi ularga ishlamaydi,
@@ -1928,109 +2249,123 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 f"sender_chat={message.sender_chat.id}, sabab={reason}"
             )
             return
-        await _handle_foreign_channel_message(context, message)
+        if await _handle_foreign_channel_message(context, message):
+            raise ApplicationHandlerStop
         return
 
     is_admin, verification_method = await is_definitely_admin(context, chat.id, user.id, user)
 
     if is_admin:
-        logger.info(f"✅ ADMIN BYPASS: user_id={user.id}, username={user.username}, is_bot={user.is_bot}, chat={chat.id}, method={verification_method}")
-
-        await db.update_user(user.id, user.username, user.first_name)
-
+        logger.info(f"✅ ADMIN BYPASS: user_id={user.id}, username={user.username}, "
+                    f"is_bot={user.is_bot}, chat={chat.id}, method={verification_method}")
+        await db.update_user(user.id, user.username, user.first_name, bump_total=True)
         return
 
-    # FAIL-OPEN: agar admin tekshiruvi tarmoq/API xatosi tufayli AMALGA OSHMAGAN bo'lsa,
-    # foydalanuvchini jazolamaymiz. Aks holda vaqtinchalik xatoda real admin reklamasi
-    # o'chirilib, warning/ban olishi mumkin. Noaniqlikda admin foydasiga ishlaymiz.
+    # FAIL-OPEN: admin tekshiruvi tarmoq/API xatosi tufayli AMALGA OSHMAGAN bo'lsa,
+    # foydalanuvchini jazolamaymiz. Noaniqlikda admin foydasiga ishlaymiz.
     if verification_method == "verification_failed":
         logger.warning(
             f"⚠️ SKIP MODERATION: user {user.id} chat {chat.id} — admin holati aniqlanmadi "
             f"(API xatosi). Xavfsizlik uchun jazo qo'llanmadi."
         )
-        await db.update_user(user.id, user.username, user.first_name)
+        await db.update_user(user.id, user.username, user.first_name, bump_total=True)
         return
 
-    logger.info(f"👤 REGULAR USER: user_id={user.id}, username={user.username}, is_bot={user.is_bot}, chat={chat.id}, verification={verification_method}")
+    logger.info(f"👤 REGULAR USER: user_id={user.id}, username={user.username}, "
+                f"is_bot={user.is_bot}, chat={chat.id}, verification={verification_method}")
 
-    await db.update_user(user.id, user.username, user.first_name)
+    await db.update_user(user.id, user.username, user.first_name, bump_total=True)
 
+    # ---------- FLOOD ----------
     if await flood_control.check(user.id, is_bot=user.is_bot, is_admin=is_admin, chat_id=chat.id):
+        logger.warning(f"🚫 FLOOD DETECTED: user {user.id} in chat {chat.id}")
+        await db.log_activity(user.id, user.username, user.first_name, chat.id,
+                              chat.title or "Unknown", message_text, "flood", "blocked")
+        deleted = True
         try:
-            logger.warning(f"🚫 FLOOD DETECTED: user {user.id} in chat {chat.id}")
-
-            await db.log_activity(user.id, user.username, user.first_name, chat.id, chat.title or "Unknown", message_text, "flood", "blocked")
             await message.delete()
-
-            user_mention = get_user_mention(user)
-            warning_msg = await message.reply_text(f"⚠️ **{user_mention}**\n\n🚫 Flooding taqiqlanadi! Iltimos, sekinroq yozing.", parse_mode='Markdown')
-
-            _schedule_delete(context, warning_msg.chat_id, warning_msg.message_id, config.WARNING_DELETE_DELAY)
         except TelegramError as e:
-            logger.error(f"Error handling flood: {e}")
+            deleted = False
+            logger.warning(f"Flood xabarini o'chirib bo'lmadi: {e}")
 
+        warning_msg = await safe_reply(
+            message,
+            f"⚠️ **{get_user_mention(user)}**\n\n🚫 Flooding taqiqlanadi! Iltimos, sekinroq yozing.")
+        if warning_msg is not None:
+            _schedule_delete(context, warning_msg.chat_id, warning_msg.message_id,
+                             config.WARNING_DELETE_DELAY)
+        if deleted:
+            raise ApplicationHandlerStop
         return
 
-    text = message.text or message.caption or ""
+    # ---------- REKLAMA / HAVOLA ----------
+    has_link, link_reason = message_has_link(message)
+    if not has_link:
+        return
 
-    if contains_link(text):
+    logger.warning(f"🚫 SPAM LINK DETECTED: user {user.id} in chat {chat.id} ({link_reason})")
+
+    deleted = True
+    try:
+        await message.delete()
+    except TelegramError as del_error:
+        deleted = False
+        logger.warning(f"Could not delete spam message: {del_error}")
+
+    await db.increment_stat('blocked_links')
+    warn_count = await db.add_warning(chat.id, user.id, user.username, user.first_name)
+    await db.log_activity(user.id, user.username, user.first_name, chat.id,
+                          chat.title or "Unknown", message_text, "spam_link",
+                          f"blocked_warn_{warn_count}")
+
+    # MUHIM: JAZO XABARDAN OLDIN qo'llanadi.
+    # Ilgari avval reply_text yuborilardi va Markdown buzilsa (masalan ism ichida "]")
+    # kod xatoga uchib, ban/mute umuman bajarilmay qolardi.
+    punishment = ""
+    if warn_count <= 0:
+        # Baza yozmadi — ogohlantirish soni noma'lum, jazo QO'LLANMAYDI
+        logger.error(f"add_warning bazaga yozilmadi (user {user.id}) — jazo qo'llanmadi")
+    elif warn_count >= config.MAX_WARNS:
         try:
-            logger.warning(f"🚫 SPAM LINK DETECTED: user {user.id} in chat {chat.id}")
-
-            try:
-                await message.delete()
-            except TelegramError as del_error:
-                logger.warning(f"Could not delete spam message: {del_error}")
-
-            await db.increment_stat('blocked_links')
-            warn_count = await db.add_warning(user.id, user.username, user.first_name)
-            await db.log_activity(user.id, user.username, user.first_name, chat.id, chat.title or "Unknown", text, "spam_link", f"blocked_warn_{warn_count}")
-
-            user_mention = get_user_mention(user)
-            group_title = escape_markdown(chat.title or "guruhda")
-
-            if warn_count <= 0:
-                # Baza yozmadi — ogohlantirish soni noma'lum. Jazo (mute/ban) QO'LLANMAYDI.
-                # Ilgari bu holatda foydalanuvchi "0/3 OGOHLANTIRISH" xabarini ko'rardi.
-                logger.error(f"add_warning bazaga yozilmadi (user {user.id}) — jazo qo'llanmadi")
-                warning_msg = await message.reply_text(f"⚠️ **{user_mention}**\n\n🚫 Reklama o'chirildi!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!", parse_mode='Markdown')
-
-            elif warn_count >= config.MAX_WARNS:
-                warning_msg = await message.reply_text(f"⛔ **{user_mention}**\n\n❌ **{warn_count}/{config.MAX_WARNS} OGOHLANTIRISH** — BAN!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!", parse_mode='Markdown')
-
-                try:
-                    await context.bot.ban_chat_member(chat.id, user.id)
-                    await db.ban_user(user.id)
-                    await db.increment_stat('banned_users')
-                    logger.info(f"🔨 User {user.id} BANNED from {chat.id}")
-                except TelegramError as e:
-                    logger.error(f"Error banning user: {e}")
-
-            elif warn_count == config.MAX_WARNS - 1:
-                mute_until = get_uz_time() + timedelta(minutes=config.MUTE_DURATION_MINUTES)
-                warning_msg = await message.reply_text(f"⚠️ **{user_mention}**\n\n🔇 **{warn_count}/{config.MAX_WARNS} OGOHLANTIRISH** — {config.MUTE_DURATION_MINUTES} daqiqa mute!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!", parse_mode='Markdown')
-
-                try:
-                    await context.bot.restrict_chat_member(chat.id, user.id, ChatPermissions(can_send_messages=False), until_date=int(mute_until.timestamp()))
-                    await db.increment_stat('muted_users')
-                    logger.info(f"🔇 User {user.id} MUTED in {chat.id} for {config.MUTE_DURATION_MINUTES} min")
-                except TelegramError as e:
-                    logger.error(f"Error muting user: {e}")
-
-            else:
-                warning_msg = await message.reply_text(f"⚠️ **{user_mention}**\n\n🚫 **{warn_count}/{config.MAX_WARNS} OGOHLANTIRISH**\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!", parse_mode='Markdown')
-
-            _schedule_delete(context, warning_msg.chat_id, warning_msg.message_id, config.WARNING_DELETE_DELAY)
-
+            await context.bot.ban_chat_member(chat.id, user.id)
+            await db.ban_user(user.id)
+            await db.increment_stat('banned_users')
+            punishment = " — BAN!"
+            logger.info(f"🔨 User {user.id} BANNED from {chat.id}")
         except TelegramError as e:
-            logger.error(f"Error handling link spam: {e}")
+            punishment = " (ban qilib bo'lmadi — bot huquqlarini tekshiring)"
+            logger.error(f"Error banning user: {e}")
+    elif warn_count == config.MAX_WARNS - 1:
+        mute_until = get_uz_time() + timedelta(minutes=config.MUTE_DURATION_MINUTES)
+        try:
+            await context.bot.restrict_chat_member(
+                chat.id, user.id, ChatPermissions(can_send_messages=False),
+                until_date=int(mute_until.timestamp()))
+            await db.increment_stat('muted_users')
+            punishment = f" — {config.MUTE_DURATION_MINUTES} daqiqa mute!"
+            logger.info(f"🔇 User {user.id} MUTED in {chat.id} for {config.MUTE_DURATION_MINUTES} min")
+        except TelegramError as e:
+            punishment = " (mute qilib bo'lmadi — bot huquqlarini tekshiring)"
+            logger.error(f"Error muting user: {e}")
 
-        return
+    user_mention = get_user_mention(user)
+    group_title = safe_md(chat.title or "guruhda")
+    if warn_count <= 0:
+        text = (f"⚠️ **{user_mention}**\n\n🚫 Reklama o'chirildi!\n\n"
+                f"⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!")
+    else:
+        head = "⛔" if warn_count >= config.MAX_WARNS else "⚠️"
+        text = (f"{head} **{user_mention}**\n\n"
+                f"🚫 **{warn_count}/{config.MAX_WARNS} OGOHLANTIRISH**{punishment}\n\n"
+                f"⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!")
 
-    # Oddiy xabarlar bazaga YOZILMAYDI: har xabarga 1 ta INSERT faqat diskni yeydi,
-    # jurnalga esa faqat moderatsiya hodisalari (spam/flood/ban) kerak.
-    # Birinchi xabarda "xush kelibsiz" ham YUBORILMAYDI — odam guruhga kirganda
-    # new_member_handler allaqachon salomlashgan, ikkinchi xabar guruhni axlatlaydi.
+    warning_msg = await safe_reply(message, text)
+    if warning_msg is not None:
+        _schedule_delete(context, warning_msg.chat_id, warning_msg.message_id,
+                         config.WARNING_DELETE_DELAY)
+
+    if deleted:
+        raise ApplicationHandlerStop
 
 
 @error_handler
@@ -2039,7 +2374,7 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     chat = update.message.chat
-    group_title = escape_markdown(chat.title or "guruh")
+    group_title = safe_md(chat.title or "guruh")
 
     bot_id = await get_bot_id(context)
     bot_added = bot_id is not None and any(
@@ -2047,25 +2382,31 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     if bot_added:
-        logger.info(f"🤖 Bot added to group {chat.id} ({group_title}) - refreshing admin list")
+        logger.info(f"🤖 Bot added to group {chat.id} - refreshing admin list")
         await admin_manager.refresh_admins(context.bot, chat.id)
 
         try:
             bot_member = await context.bot.get_chat_member(chat.id, bot_id)
-
             if bot_member.status == 'administrator':
-                can_delete = bot_member.can_delete_messages
-                can_restrict = bot_member.can_restrict_members
-
-                if can_delete and can_restrict:
-                    setup_msg = await update.message.reply_text("✅ **Bot muvaffaqiyatli faollashtirildi!**\n\n🛡 Guruhingiz endi spam va reklamadan himoyalangan.\n\n**Bot qanday ishlaydi:**\n• Link va reklama avtomatik o'chiriladi\n• 3 marta ogohlantirish → ban\n• Adminlar erkn yoza oladi\n• Yangi a'zolarga xush kelibsiz xabari", parse_mode='Markdown')
+                if bot_member.can_delete_messages and bot_member.can_restrict_members:
+                    setup_text = ("✅ **Bot muvaffaqiyatli faollashtirildi!**\n\n"
+                                  "🛡 Guruhingiz endi spam va reklamadan himoyalangan.\n\n"
+                                  "**Bot qanday ishlaydi:**\n"
+                                  "• Link va reklama avtomatik o'chiriladi\n"
+                                  f"• {config.MAX_WARNS} marta ogohlantirish → ban\n"
+                                  f"• Ogohlantirish {config.WARN_TTL_DAYS} kundan keyin kuyadi\n"
+                                  "• Adminlar erkin yoza oladi")
                 else:
-                    setup_msg = await update.message.reply_text("⚠️ **Bot admin huquqlari to'liq emas!**\n\nGuruh to'liq ishlashi uchun botga quyidagi huquqlarni bering:\n\n✅ **Delete messages**\n✅ **Ban users**\n✅ **Restrict members**", parse_mode='Markdown')
+                    setup_text = ("⚠️ **Bot admin huquqlari to'liq emas!**\n\n"
+                                  "Guruh to'liq ishlashi uchun botga quyidagi huquqlarni bering:\n\n"
+                                  "✅ **Delete messages**\n✅ **Ban users**\n✅ **Restrict members**")
             else:
-                setup_msg = await update.message.reply_text("❌ **Bot admin emas!**\n\n⚠️ **MUHIM:** Guruh to'liq ishlashi uchun botni **ADMIN** qiling!", parse_mode='Markdown')
+                setup_text = ("❌ **Bot admin emas!**\n\n"
+                              "⚠️ **MUHIM:** Guruh to'liq ishlashi uchun botni **ADMIN** qiling!")
 
-            _schedule_delete(context, setup_msg.chat_id, setup_msg.message_id, 60)
-
+            setup_msg = await safe_reply(update.message, setup_text)
+            if setup_msg is not None:
+                _schedule_delete(context, setup_msg.chat_id, setup_msg.message_id, 60)
         except TelegramError as e:
             logger.error(f"Error sending setup instructions: {e}")
 
@@ -2073,15 +2414,17 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if new_member.is_bot:
             continue
 
-        user_mention = get_user_mention(new_member)
-
-        try:
-            welcome_msg = await update.message.reply_text(f"👋 Xush kelibsiz, **{user_mention}**!\n\n⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!\n\n🛡 Bu guruh spam va reklamadan himoyalangan.", parse_mode='Markdown')
+        welcome_msg = await safe_reply(
+            update.message,
+            f"👋 Xush kelibsiz, **{get_user_mention(new_member)}**!\n\n"
+            f"⚠️ Iltimos **\"{group_title}\"** guruhida reklama tarqatmang!\n\n"
+            f"🛡 Bu guruh spam va reklamadan himoyalangan.")
+        if welcome_msg is not None:
             _schedule_delete(context, welcome_msg.chat_id, welcome_msg.message_id, 15)
-        except TelegramError as e:
-            logger.error(f"Error sending welcome message: {e}")
 
-        await db.update_user(new_member.id, new_member.username, new_member.first_name)
+        # count_message=False: guruhga kirish "xabar" emas
+        await db.update_user(new_member.id, new_member.username, new_member.first_name,
+                            count_message=False)
 
     try:
         await update.message.delete()
@@ -2146,6 +2489,10 @@ async def post_init(application: Application) -> None:
             deleted = await db.cleanup_old_activity(days=7)
             if deleted:
                 logger.info(f"🧹 Activity log: {deleted} ta eski yozuv o'chirildi")
+            # Muddati o'tgan ogohlantirishlar ham tozalanadi
+            warns = await db.cleanup_old_warnings()
+            if warns:
+                logger.info(f"🧹 Ogohlantirishlar: {warns} ta muddati o'tgan yozuv o'chirildi")
 
         async def backup_job():
             await db.backup()
@@ -2173,7 +2520,7 @@ async def post_init(application: Application) -> None:
             # Memory leak oldini olish: o'lik guruhlar keshini tozalaymiz
             admin_manager.prune(active_ids)
             active_set = set(active_ids)
-            for cache in (_group_refresh, _linked_chat):
+            for cache in (_group_refresh, _linked_chat, _group_start_reply):
                 for cid in list(cache.keys()):
                     if cid not in active_set:
                         del cache[cid]
@@ -2204,6 +2551,15 @@ async def post_init(application: Application) -> None:
 
 async def post_shutdown(application: Application) -> None:
     """Bot to'xtaganda scheduler va baza ulanishini tartibli yopadi."""
+    task = application.bot_data.get('initial_refresh_task')
+    if task is not None and not task.done():
+        # Ilgari bekor qilinmasdi va bot o'chganda "Task was destroyed" ogohlantirishi chiqardi
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     scheduler = application.bot_data.get('scheduler')
     if scheduler is not None:
         try:
@@ -2219,44 +2575,51 @@ async def error_callback(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
     error_type = type(error).__name__
     error_msg = str(error)
 
-    critical_errors = ['Unauthorized', 'InvalidToken']
-    is_critical = any(err in error_type for err in critical_errors)
+    # PTB v20+ da "Unauthorized" klassi YO'Q — u o'lik satr edi.
+    # Haqiqiy kritik holat: token noto'g'ri yoki bekor qilingan.
+    is_critical = error_type in ('InvalidToken',) or '401' in error_msg
 
     # Conflict = bir token ostida IKKI bot instansi ishlamoqda (deploy muammosi).
-    # Buni jim yutmaymiz — aniq ERROR sifatida log qilamiz, aks holda muammo berkitiladi.
     if 'Conflict' in error_type:
         logger.error(f"🚨 CONFLICT: bir token ostida bir nechta bot instansi ishlayotgan bo'lishi mumkin! {error_msg}")
         return
 
     # Oddiy tarmoq/ulanish xatolari — adminni spamlamaymiz
-    ignored_errors = ['NetworkError', 'TimedOut', 'ReadError']
-    if any(err in error_type for err in ignored_errors):
+    if error_type in ('NetworkError', 'TimedOut', 'ReadError', 'RemoteProtocolError'):
         logger.warning(f"⚠️ Oddiy tarmoq/ulanish xatosi: {error_type} - {error_msg}")
         return
 
     if is_critical:
-        # InvalidToken/Unauthorized — bot ishlay olmaydi, AVTOMATIK tiklanmaydi. Aniq ERROR.
         logger.error(f"🚨 KRITIK: {error_type} - {error_msg} — bot token/ruxsatini tekshiring!")
 
-        # Throttle: bir xil kritik xato takrorlanganda admin chati spamlanmasligi uchun
         global _critical_alert_ts
         now = asyncio.get_event_loop().time()
         if now - _critical_alert_ts < _CRITICAL_ALERT_INTERVAL:
             return
         _critical_alert_ts = now
 
-        try:
-            alert_text = (
-                f"🚨 **KRITIK BOT XATOLIGI**\n\n"
-                f"⚠️ Turi: `{error_type}`\n📝 Xabar: {error_msg[:200]}\n⏰ {format_uz_time()}\n\n"
-                f"❗️ Bot ishlay olmayapti — token yoki ruxsatlarni darhol tekshiring."
-            )
-            await context.bot.send_message(chat_id=config.ADMIN_ID, text=alert_text, parse_mode='Markdown')
+        # DIQQAT: xato matni safe_md bilan tozalanadi va safe_send zaxira yo'li bor.
+        # Ilgari matn qalqonlanmasdi: "message_id_invalid" kabi xatodagi "_" belgisi
+        # tufayli ogohlantirishning O'ZI yuborilmay qolardi.
+        alert_text = (
+            f"🚨 **KRITIK BOT XATOLIGI**\n\n"
+            f"⚠️ Turi: `{safe_md(error_type)}`\n"
+            f"📝 Xabar: {safe_md(error_msg[:200])}\n"
+            f"⏰ {format_uz_time()}\n\n"
+            f"❗️ Bot ishlay olmayapti — token yoki ruxsatlarni darhol tekshiring."
+        )
+        if await safe_send(context.bot, config.ADMIN_ID, alert_text) is not None:
             logger.info(f"✅ Critical error alert sent: {error_type}")
-        except Exception as e:
-            logger.error(f"Failed to send error alert: {e}")
-    else:
-        logger.error(f"Exception while handling update {update}:", exc_info=error)
+        return
+
+    # MAXFIYLIK: butun update obyektini logga yozmaymiz — unda xabar matni bo'ladi
+    # va bu LOG_MESSAGE_TEXT=false va'dasiga qarshi. Faqat kim/qayerda yoziladi.
+    where = "—"
+    if isinstance(update, Update):
+        chat = update.effective_chat
+        user = update.effective_user
+        where = f"update_id={update.update_id}, chat={chat.id if chat else '—'}, user={user.id if user else '—'}"
+    logger.error(f"Handler xatosi ({where}): {error_type}", exc_info=error)
 
 
 def main() -> None:
@@ -2281,6 +2644,10 @@ def main() -> None:
     application = (
         Application.builder()
         .token(config.BOT_TOKEN)
+        # PARALLEL ISHLOV: default holatda PTB bir vaqtda FAQAT BITTA xabarni
+        # qayta ishlaydi (max_concurrent_updates=1). get_chat_member kabi so'rovlar
+        # 0.2-0.5 sekund olgani uchun butun bot sekundiga 2-5 xabarga tushib qolardi.
+        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .read_timeout(30)
@@ -2314,10 +2681,17 @@ def main() -> None:
 
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_handler))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_message_handler))
-    # Guruh xabarlari. MessageHandler default holatda tahrirlangan (edited) xabarlarni ham
-    # ushlaydi, group_message_handler esa effective_message ishlatadi — shuning uchun
-    # link bypass (toza yuborib keyin tahrirlash) avtomatik qamrab olinadi.
-    application.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, group_message_handler))
+
+    # MODERATSIYA — group=-1, ya'ni BARCHA boshqa handlerlardan OLDIN ishlaydi va
+    # KOMANDALARNI HAM tekshiradi.
+    # Ilgari "~filters.COMMAND" bor edi: "/reklama http://spam.com" kabi xabar
+    # moderatsiyaga umuman tushmasdi — bu eng katta teshik edi.
+    # Xizmat xabarlari (kirish/chiqish) chiqarib tashlanadi — ular uchun alohida handler bor.
+    # Tahrirlangan (edited) xabarlar avtomatik qamraladi (effective_message).
+    application.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, group_message_handler),
+        group=-1,
+    )
 
     logger.info("✅ All handlers registered")
     logger.info("🟢 Bot is running...")

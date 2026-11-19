@@ -4,8 +4,12 @@ Telegram guruhlarini spam va reklamadan tozalaydigan bot.
 
 ## Nima qiladi
 
-- Link, domen va reklama xabarlarini avtomatik o'chiradi
+- Link, domen (subdomenlar bilan) va reklama xabarlarini avtomatik o'chiradi
+- **Matn ostiga yashirilgan havolani** ham ushlaydi ("Bu yerni bosing" → spam.com)
+- **Komandalarni ham tekshiradi**: `/reklama http://spam.com` ham o'chiriladi
 - 3 marta ogohlantirish: 2-da 10 daqiqa mute, 3-da ban
+- Ogohlantirishlar **har guruh uchun alohida** va 30 kundan keyin o'z-o'zidan kuyadi
+- Takroriy reklama yuborgan kanal guruhdan bloklanadi (`ban_chat_sender_chat`)
 - Flood nazorati (har guruh uchun alohida hisoblanadi)
 - Adminlar erkin yozadi (3 qatlamli tekshiruv: kesh → API → anonim admin)
 - Admin panel: statistika, guruhlar, foydalanuvchilar, xabar tarqatish
@@ -47,9 +51,9 @@ mantig'i, baza va backup lokal tekshiriladi.
 
 | Komanda | Vazifasi |
 |---|---|
-| `/unwarn` | ogohlantirishlarni tozalash |
+| `/unwarn` | shu guruhdagi ogohlantirishlarni tozalash |
 | `/unban` | banni olib tashlash |
-| `/unmute` | mute'ni olib tashlash |
+| `/unmute` | mute'ni olib tashlash (barcha huquqlar qaytariladi) |
 
 Har biri xabarga **reply** qilib yoki `/unban <ID yoki @username>` shaklida ishlaydi.
 
@@ -76,6 +80,18 @@ xabarlar alohida tekshiriladi va quyidagilar **o'chirilmaydi**:
 
 Boshqa kanal nomidan kelgan reklama o'chiriladi (kanalga ogohlantirish
 berib bo'lmaydi, shuning uchun faqat xabar o'chadi).
+
+## Moderatsiya qanday ishlaydi
+
+Moderatsiya handleri `group=-1` da ro'yxatdan o'tadi — ya'ni barcha boshqa
+handlerlardan **oldin** ishlaydi va komandalarni ham qamrab oladi. Xabar
+o'chirilsa `ApplicationHandlerStop` ko'tariladi va qolgan handlerlar
+o'chirilgan xabarga javob bermaydi.
+
+Jazo (ban/mute) **ogohlantirish xabari yuborilishidan oldin** qo'llanadi —
+shunday qilib xabar yuborishdagi har qanday xato jazoni bekor qilmaydi.
+Foydalanuvchi ismi va guruh nomi `safe_md()` bilan tozalanadi: Markdown
+orqali botning o'z xabariga havola joylash mumkin emas.
 
 ## Maxfiylik
 

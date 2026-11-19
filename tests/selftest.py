@@ -82,6 +82,76 @@ for t in [
 ]:
     check(f'PASS   {t[:45]!r}', m.contains_link(t), False)
 
+# ------------------------------------------------- 2b. Yashirin havola va komandalar
+section('Yashirin havola (text_link) va komanda-bypass')
+
+from telegram import MessageEntity  # noqa: E402
+from telegram.ext import filters as _f, ApplicationHandlerStop  # noqa: E402
+import datetime as _dt  # noqa: E402
+from telegram import Update as _Upd, Message as _Msg, Chat as _Chat, User as _Usr  # noqa: E402
+
+
+def _gmsg(text, entities=None, caption=None, caption_entities=None):
+    return _Msg(message_id=1, date=_dt.datetime.now(_dt.timezone.utc),
+                chat=_Chat(id=-100777, type='supergroup'),
+                from_user=_Usr(id=9, first_name='S', is_bot=False),
+                text=text, entities=entities or [],
+                caption=caption, caption_entities=caption_entities or [])
+
+
+hidden = _gmsg('Bu yerni bosing', entities=[
+    MessageEntity(type='text_link', offset=0, length=14, url='http://spam.com')])
+check('matnda link yo\'q, lekin YASHIRIN havola bor -> bloklanadi',
+      m.message_has_link(hidden)[0], True)
+check('toza matn -> o\'tadi', m.message_has_link(_gmsg('Salom qalaysan'))[0], False)
+check('ochiq link matnda -> bloklanadi', m.message_has_link(_gmsg('http://spam.com'))[0], True)
+cap = _gmsg(None, caption='Rasm', caption_entities=[
+    MessageEntity(type='text_link', offset=0, length=4, url='http://spam.com')])
+check('rasm izohidagi yashirin havola -> bloklanadi', m.message_has_link(cap)[0], True)
+
+# Moderatsiya filtri: komandalar HAM tekshirilishi kerak
+mod_filter = _f.ChatType.GROUPS & ~_f.StatusUpdate.ALL
+cmd = _gmsg('/reklama http://spam.com', entities=[
+    MessageEntity(type='bot_command', offset=0, length=8)])
+check('"/reklama <link>" moderatsiyaga TUSHADI',
+      bool(mod_filter.check_update(_Upd(update_id=1, message=cmd))), True)
+check('tahrirlangan xabar ham moderatsiyaga tushadi',
+      bool(mod_filter.check_update(_Upd(update_id=2, edited_message=cmd))), True)
+
+# --------------------------------------------------------------- 2c. Markdown xavfsizligi
+section('Markdown injection himoyasi')
+
+
+class _EvilUser:
+    username = None
+    first_name = 'Ali](http://evil.com)'
+    id = 7
+
+
+mention = m.get_user_mention(_EvilUser())
+check('ism ichidagi ")" olib tashlanadi', ')' in mention.split('](tg://')[0], False)
+check('ism ichidagi "]" olib tashlanadi', ']' in mention.split('](tg://')[0], False)
+check('havola injection ishlamaydi', 'evil.com)' in mention, False)
+check('mention baribir ishlaydi', mention.endswith('(tg://user?id=7)'), True)
+
+
+class _EvilUser2:
+    username = 'ali_bek'
+    first_name = 'Ali'
+    id = 8
+
+
+check('username dagi "_" qalqonlanadi', m.get_user_mention(_EvilUser2()), '@ali\\_bek')
+check('safe_md guruh nomini tozalaydi', m.safe_md('Guruh](http://x.com)'), 'Guruhhttp://x.com')
+check('plain_text Markdown belgilarini olib tashlaydi',
+      m.plain_text('**Ali** _bek_ `kod`'), 'Ali bek kod')
+
+# --------------------------------------------------------------- 2d. ENV tekshiruvi
+section('ENV qiymatlarini tekshirish')
+os.environ['TEST_IDS'] = '111, -222 ; --5 , 12a, 333'
+check('noto\'g\'ri ID lar e\'tiborsiz qoldiriladi',
+      sorted(m._env_ids('TEST_IDS')), [-222, 111, 333])
+
 # --------------------------------------------------------------- 3. Broadcast xatolari
 section('Broadcast xato klassifikatsiyasi')
 from telegram.error import Forbidden, BadRequest  # noqa: E402
@@ -107,7 +177,7 @@ check('Internal Server Error -> transient',
 # --------------------------------------------------------------- 3b. sender_chat
 section('Kanal/anonim admin nomidan yuborilgan xabarlar')
 from types import SimpleNamespace  # noqa: E402
-from telegram.error import TelegramError  # noqa: E402
+from telegram.error import TelegramError, BadRequest  # noqa: E402
 
 check('ALLOWED_CHANNELS username o\'qildi',
       'sedoy_parfyum' in m.config.ALLOWED_CHANNEL_USERNAMES, True)
@@ -240,7 +310,11 @@ async def flood_tests():
 
     fc4 = m.FloodControl(limit=1, window=5)
     res4 = [await fc4.check(1, is_bot=True, chat_id=-100) for _ in range(5)]
-    check('bot hech qachon flood emas', any(res4), False)
+    check('begona BOT ham flood hisobiga tushadi', res4[-1], True)
+
+    fc5 = m.FloodControl(limit=1, window=5)
+    res5 = [await fc5.check(1, is_bot=True, is_admin=True, chat_id=-100) for _ in range(5)]
+    check('admin bot ozod', any(res5), False)
 
 
 # --------------------------------------------------------------- 5. Baza
@@ -250,8 +324,29 @@ async def db_tests():
     await m.db.update_user(111, 'ali', 'Ali')
     await m.db.update_group(-100123, 'Test guruh', 50)
 
-    check('add_warning 1-marta', await m.db.add_warning(111, 'ali', 'Ali'), 1)
-    check('add_warning 2-marta', await m.db.add_warning(111, 'ali', 'Ali'), 2)
+    check('add_warning 1-marta', await m.db.add_warning(-100123, 111, 'ali', 'Ali'), 1)
+    check('add_warning 2-marta', await m.db.add_warning(-100123, 111, 'ali', 'Ali'), 2)
+    check('BOSHQA guruhda hisob 1 dan boshlanadi',
+          await m.db.add_warning(-100999, 111, 'ali', 'Ali'), 1)
+    check('get_warnings(1-guruh)', await m.db.get_warnings(-100123, 111), 2)
+    check('get_warnings(2-guruh)', await m.db.get_warnings(-100999, 111), 1)
+    await m.db.reset_warnings(111, chat_id=-100999)
+    check('reset faqat bitta guruhga ta\'sir qiladi',
+          (await m.db.get_warnings(-100123, 111), await m.db.get_warnings(-100999, 111)), (2, 0))
+
+    # Muddati o'tgan ogohlantirish 1 dan boshlanadi
+    async with m.db.get_connection() as conn:
+        await conn.execute("UPDATE chat_warnings SET updated_at = datetime('now','-400 days') "
+                           "WHERE chat_id = ? AND user_id = ?", (-100123, 111))
+        await conn.commit()
+    check('eski ogohlantirish ko\'rinmaydi', await m.db.get_warnings(-100123, 111), 0)
+    check('muddati o\'tgach hisob 1 dan boshlanadi',
+          await m.db.add_warning(-100123, 111, 'ali', 'Ali'), 1)
+    async with m.db.get_connection() as conn:
+        await conn.execute("UPDATE chat_warnings SET updated_at = datetime('now','-400 days')")
+        await conn.commit()
+    check('cleanup_old_warnings eskilarni o\'chiradi',
+          await m.db.cleanup_old_warnings() >= 1, True)
 
     await m.db.log_activity(111, 'ali', 'Ali', -100123, 'Test', 'shaxsiy gap', 'normal_message', 'allowed')
     await m.db.log_activity(111, 'ali', 'Ali', -100123, 'Test', 'google.com reklama', 'spam_link', 'blocked_warn_1')
@@ -268,6 +363,13 @@ async def db_tests():
     await m.db.deactivate_group(-100123)
     check('faolsizlantirilgandan keyin 0 guruh', len(await m.db.get_active_groups()), 0)
     check('stats.users', (await m.db.get_stats())['users'], 1)
+    check('stats.subscribers (hali obuna emas)', (await m.db.get_stats())['subscribers'], 0)
+    await m.db.mark_user_started(111, 'ali', 'Ali')
+    check('mark_user_started -> obunachi', (await m.db.get_stats())['subscribers'], 1)
+    await m.db.update_user(111, 'ali', 'Ali', count_message=False)
+    async with m.db.get_connection() as conn:
+        row = await (await conn.execute('SELECT message_count FROM users WHERE user_id = 111')).fetchone()
+    check('count_message=False xabarni sanamaydi', row['message_count'], 1)
 
     section('Baza: bitta ulanish + parallel yozish')
     await asyncio.gather(*[m.db.update_user(200 + i % 7, f'u{i}', 'U') for i in range(300)])
@@ -319,12 +421,138 @@ async def cache_tests():
     check('is_fresh(bo\'sh)', am.is_fresh(-999), False)
 
 
+# ------------------------------------------- 6b. Uchidan-uchiga: moderatsiya qarori
+class _FakeMsg:
+    """reply_text() ni ataylab yiqitib ko'rish uchun soxta xabar."""
+
+    def __init__(self, text, chat, user, reply_fails=False):
+        self.text = text
+        self.caption = None
+        self.entities = []
+        self.caption_entities = []
+        self.chat = chat
+        self.from_user = user
+        self.sender_chat = None
+        self.is_automatic_forward = False
+        self.message_id = 1
+        self.chat_id = chat.id
+        self.deleted = False
+        self.reply_fails = reply_fails
+        self.replies = []
+
+    async def delete(self):
+        self.deleted = True
+
+    async def reply_text(self, text, parse_mode=None, **kw):
+        if self.reply_fails and parse_mode == 'Markdown':
+            raise BadRequest("Can't parse entities: can't find end of the entity")
+        self.replies.append(text)
+        return SimpleNamespace(chat_id=self.chat.id, message_id=2)
+
+
+class _ModBot:
+    def __init__(self, admin_ids=()):
+        self.admin_ids = set(admin_ids)
+        self.banned = []
+        self.muted = []
+
+    async def get_chat_member_count(self, chat_id):
+        return 10
+
+    async def get_chat_administrators(self, chat_id):
+        return [SimpleNamespace(user=SimpleNamespace(id=i)) for i in self.admin_ids]
+
+    async def get_chat_member(self, chat_id, user_id):
+        status = 'administrator' if user_id in self.admin_ids else 'member'
+        return SimpleNamespace(status=status)
+
+    async def ban_chat_member(self, chat_id, user_id):
+        self.banned.append(user_id)
+
+    async def restrict_chat_member(self, chat_id, user_id, permissions, until_date=None):
+        self.muted.append(user_id)
+
+
+async def moderation_e2e_tests():
+    section('Uchidan-uchiga: moderatsiya qarori')
+    await m.db.init()
+    chat = SimpleNamespace(id=-100555, title='Sinov guruh', type='supergroup')
+    spammer = SimpleNamespace(id=4242, username='spam', first_name='Sp', is_bot=False)
+    admin = SimpleNamespace(id=777, username='boss', first_name='B', is_bot=False)
+
+    bot = _ModBot(admin_ids=[admin.id])
+    m.admin_manager._admins.clear()
+    m.admin_manager._last_refresh.clear()
+    m._group_refresh.clear()
+
+    def ctx(b):
+        return SimpleNamespace(bot=b, job_queue=None)
+
+    # 1. "/reklama <link>" — komanda bo'lsa ham o'chirilishi SHART
+    msg = _FakeMsg('/reklama http://spam.com', chat, spammer)
+    upd = SimpleNamespace(effective_message=msg)
+    try:
+        await m.group_message_handler(upd, ctx(bot))
+        stopped = False
+    except ApplicationHandlerStop:
+        stopped = True
+    check('"/reklama <link>" o\'chirildi', msg.deleted, True)
+    check('o\'chirilgandan keyin boshqa handlerlar to\'xtatiladi', stopped, True)
+    check('1-ogohlantirish berildi', await m.db.get_warnings(chat.id, spammer.id), 1)
+    check('ban hali yo\'q', bot.banned, [])
+
+    # 2. 2-ogohlantirish -> MUTE
+    msg2 = _FakeMsg('yana reklama shop.spam.com', chat, spammer)
+    try:
+        await m.group_message_handler(SimpleNamespace(effective_message=msg2), ctx(bot))
+    except ApplicationHandlerStop:
+        pass
+    check('subdomen ham ushlandi', msg2.deleted, True)
+    check('2-ogohlantirishda MUTE', bot.muted, [spammer.id])
+
+    # 3. 3-ogohlantirish -> BAN, VA reply_text yiqilsa ham ban bajarilishi SHART
+    msg3 = _FakeMsg('oxirgi reklama t.me/kanal', chat, spammer, reply_fails=True)
+    try:
+        await m.group_message_handler(SimpleNamespace(effective_message=msg3), ctx(bot))
+    except ApplicationHandlerStop:
+        pass
+    check('3-ogohlantirishda BAN', bot.banned, [spammer.id])
+    check('Markdown yiqilsa ham jazo bajarildi (tartib tuzatilgan)', bot.banned, [spammer.id])
+    check('zaxira yo\'l bilan oddiy matn yuborildi', len(msg3.replies), 1)
+
+    # 4. ADMIN xabari — hech narsa qilinmaydi
+    amsg = _FakeMsg('mening saytim http://sedoyparfyum.uz', chat, admin)
+    await m.group_message_handler(SimpleNamespace(effective_message=amsg), ctx(bot))
+    check('admin linki O\'CHIRILMAYDI', amsg.deleted, False)
+
+    # 5. Anonim admin (guruh nomidan) — o'chirilmaydi
+    anon = _FakeMsg('reklama http://spam.com', chat, spammer)
+    anon.sender_chat = SimpleNamespace(id=chat.id, username=None, title=chat.title)
+    await m.group_message_handler(SimpleNamespace(effective_message=anon), ctx(bot))
+    check('anonim admin posti O\'CHIRILMAYDI', anon.deleted, False)
+
+    # 6. Yashirin havola — o'chiriladi
+    hidden = _FakeMsg('Bu yerni bosing', chat, SimpleNamespace(
+        id=5151, username=None, first_name='H', is_bot=False))
+    hidden.entities = [SimpleNamespace(type='text_link', url='http://spam.com')]
+    try:
+        await m.group_message_handler(SimpleNamespace(effective_message=hidden), ctx(bot))
+    except ApplicationHandlerStop:
+        pass
+    check('yashirin havola o\'chirildi', hidden.deleted, True)
+
+    await m.db.reset_warnings(spammer.id)
+    # aiosqlite ulanishi yopilmasa, uning foniy oqimi jarayonni tirik ushlab turadi
+    await m.db.close()
+
+
 async def main_async():
     await sender_chat_tests()
     await bot_id_tests()
     await flood_tests()
     await db_tests()
     await cache_tests()
+    await moderation_e2e_tests()
 
 
 asyncio.run(main_async())
